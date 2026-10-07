@@ -4,6 +4,36 @@ class ModBotException(Exception):
         self.message = message
         super().__init__(self.message)
 
+
+class ConfigurationError(ModBotException):
+    """Raised when the bot cannot start with the configured environment."""
+    pass
+
+
+class ModerationError(ModBotException):
+    """Base exception for expected moderation failures."""
+    pass
+
+
+class PermissionDenied(ModerationError):
+    pass
+
+
+class InvalidTarget(ModerationError):
+    pass
+
+
+class InvalidDuration(ModerationError):
+    pass
+
+
+class CaseNotFound(ModerationError):
+    pass
+
+
+class InvalidCase(ModerationError):
+    pass
+
 class RBACAccessDenied(ModBotException):
     """Raised when a user lacks permission for a command"""
     pass

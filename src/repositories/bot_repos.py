@@ -1,5 +1,9 @@
 from src.repositories.base import BaseRepository
-from src.models.domain import GuildConfig, Warn, Note, Punishment
+from datetime import datetime, timezone
+from typing import Any
+
+from src.core.database import Database
+from src.models.domain import Case, GuildConfig, Note, Punishment, Warn
 from typing import Optional, List
 
 class ConfigRepository(BaseRepository):
@@ -23,6 +27,16 @@ class WarnRepository(BaseRepository):
         docs = await self.find_many({"guild_id": guild_id, "user_id": user_id})
         return [Warn(**d) for d in docs]
 
+    async def get_by_case_number(self, guild_id: int, case_number: int) -> Optional[Warn]:
+        doc = await self.find_one({"guild_id": guild_id, "case_number": case_number})
+        return Warn(**doc) if doc else None
+
+    async def revoke(self, guild_id: int, case_number: int) -> int:
+        return await self.update_one(
+            {"guild_id": guild_id, "case_number": case_number, "revoked": {"$ne": True}},
+            {"$set": {"revoked": True}},
+        )
+
 class NoteRepository(BaseRepository):
     def __init__(self):
         super().__init__("notes")
@@ -45,6 +59,92 @@ class PunishmentRepository(BaseRepository):
         await self.update_one(
             {"guild_id": guild_id, "user_id": user_id, "type": p_type, "active": True},
             {"$set": {"active": False}}
+        )
+
+    async def mark_inactive_by_case(self, guild_id: int, case_number: int) -> int:
+        return await self.update_one(
+            {"guild_id": guild_id, "case_number": case_number, "active": True},
+            {"$set": {"active": False}},
+        )
+
+
+class CaseRepository(BaseRepository):
+    def __init__(self):
+        super().__init__("cases")
+
+    async def create_case(
+        self,
+        *,
+        guild_id: int,
+        action: str,
+        target_user_id: int | None,
+        moderator_id: int,
+        reason: str,
+        duration_seconds: int | None = None,
+        channel_id: int | None = None,
+        amount: int | None = None,
+        related_case_number: int | None = None,
+        command_source: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Case:
+        case_number = await Database.next_case_number(guild_id)
+        document = {
+            "case_number": case_number,
+            "guild_id": guild_id,
+            "action": action,
+            "target_user_id": target_user_id,
+            "moderator_id": moderator_id,
+            "reason": reason,
+            "duration_seconds": duration_seconds,
+            "channel_id": channel_id,
+            "amount": amount,
+            "created_at": datetime.now(timezone.utc),
+            "active": True,
+            "revoked": False,
+            "related_case_number": related_case_number,
+            "command_source": command_source,
+            "metadata": metadata or {},
+        }
+        case_id = await self.insert_one(document)
+        document["_id"] = case_id
+        return Case(**document)
+
+    async def get_case(self, guild_id: int, case_number: int) -> Optional[Case]:
+        document = await self.find_one({"guild_id": guild_id, "case_number": case_number})
+        return Case(**document) if document else None
+
+    async def get_latest_active(
+        self, guild_id: int, target_user_id: int, action: str
+    ) -> Optional[Case]:
+        document = await self.col.find_one(
+            {
+                "guild_id": guild_id,
+                "target_user_id": target_user_id,
+                "action": action,
+                "revoked": False,
+            },
+            sort=[("case_number", -1)],
+        )
+        return Case(**document) if document else None
+
+    async def list_cases(
+        self,
+        guild_id: int,
+        *,
+        target_user_id: int | None = None,
+        page: int = 1,
+        page_size: int = 10,
+    ) -> list[Case]:
+        query: dict[str, Any] = {"guild_id": guild_id}
+        if target_user_id is not None:
+            query["target_user_id"] = target_user_id
+        cursor = self.col.find(query).sort("case_number", -1).skip((page - 1) * page_size).limit(page_size)
+        return [Case(**document) for document in await cursor.to_list(length=page_size)]
+
+    async def revoke(self, guild_id: int, case_number: int) -> int:
+        return await self.update_one(
+            {"guild_id": guild_id, "case_number": case_number, "revoked": False},
+            {"$set": {"revoked": True, "active": False}},
         )
 
 class RBACRepository(BaseRepository):

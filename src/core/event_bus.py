@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from typing import Callable, Dict, List, Any
 import logging
 
@@ -23,7 +24,7 @@ class EventBus:
     @classmethod
     async def _execute_callback(cls, callback: Callable, *args, **kwargs):
         try:
-            if asyncio.iscoroutinefunction(callback):
+            if inspect.iscoroutinefunction(callback):
                 await callback(*args, **kwargs)
             else:
                 callback(*args, **kwargs)

@@ -1,27 +1,38 @@
 from datetime import datetime
-from typing import Optional, List, Dict
-from pydantic import BaseModel, Field
+from typing import Annotated, Any, Optional
+
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+
+MongoId = Annotated[str, BeforeValidator(str)]
+
+
+class DomainModel(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
 
 # Base Models to map MongoDB documents
 
-class Warn(BaseModel):
-    id: str = Field(alias="_id")
+class Warn(DomainModel):
+    id: MongoId = Field(alias="_id")
     guild_id: int
     user_id: int
     moderator_id: int
     reason: str
     created_at: datetime
+    case_number: Optional[int] = None
+    revoked: bool = False
     
-class Note(BaseModel):
-    id: str = Field(alias="_id")
+class Note(DomainModel):
+    id: MongoId = Field(alias="_id")
     guild_id: int
     user_id: int
     moderator_id: int
     note: str
     created_at: datetime
+    case_number: Optional[int] = None
     
-class Punishment(BaseModel):
-    id: str = Field(alias="_id")
+class Punishment(DomainModel):
+    id: MongoId = Field(alias="_id")
     guild_id: int
     user_id: int
     moderator_id: int
@@ -30,9 +41,29 @@ class Punishment(BaseModel):
     active: bool = True
     expires_at: Optional[datetime] = None
     created_at: datetime
+    case_number: Optional[int] = None
 
-class GuildConfig(BaseModel):
-    id: str = Field(alias="_id")
+
+class Case(DomainModel):
+    id: MongoId = Field(alias="_id")
+    case_number: int
+    guild_id: int
+    action: str
+    target_user_id: Optional[int] = None
+    moderator_id: int
+    reason: str
+    duration_seconds: Optional[int] = None
+    channel_id: Optional[int] = None
+    amount: Optional[int] = None
+    created_at: datetime
+    active: bool = True
+    revoked: bool = False
+    related_case_number: Optional[int] = None
+    command_source: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+class GuildConfig(DomainModel):
+    id: MongoId = Field(alias="_id")
     guild_id: int
     
     # Modules
@@ -49,15 +80,15 @@ class GuildConfig(BaseModel):
     log_channel_id: Optional[int] = None
     alert_channel_id: Optional[int] = None
 
-class RolePermission(BaseModel):
-    id: str = Field(alias="_id")
+class RolePermission(DomainModel):
+    id: MongoId = Field(alias="_id")
     guild_id: int
     role_id: int
     # List of allowed command names or module identifiers (e.g. "ban", "warn", "config")
-    allowed_commands: List[str] = []
+    allowed_commands: list[str] = Field(default_factory=list)
     
-class UserPermission(BaseModel):
-    id: str = Field(alias="_id")
+class UserPermission(DomainModel):
+    id: MongoId = Field(alias="_id")
     guild_id: int
     user_id: int
-    allowed_commands: List[str] = []
+    allowed_commands: list[str] = Field(default_factory=list)

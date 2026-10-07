@@ -1,12 +1,13 @@
 import discord
 from discord.ext import commands
+import asyncio
+import logging
+from contextlib import suppress
+
 from src.core.database import Database
 from src.core.redis_client import RedisClient
 from src.services.log_service import LogService
-from src.core.exceptions import ModBotException, RBACAccessDenied
 from src.utils.embeds import format_error
-import asyncio
-import logging
 
 log = logging.getLogger("modbot.bot")
 
@@ -58,6 +59,8 @@ class ModBot(commands.AutoShardedBot):
         log.info("Shutting down bot...")
         if hasattr(self, '_bg_task'):
             self._bg_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._bg_task
         await Database.close()
         await RedisClient.close()
         await super().close()

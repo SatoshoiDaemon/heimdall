@@ -79,6 +79,8 @@ class LogService:
                 )
                 if item.get('moderator_id'):
                     embed.set_footer(text=f"Mod ID: {item['moderator_id']}")
+                if item.get('case_number'):
+                    embed.set_footer(text=f"Case #{item['case_number']} | Mod ID: {item.get('moderator_id', 'n/a')}")
                 embeds.append(embed)
             
             # Send up to 10 embeds per message (Discord limit)

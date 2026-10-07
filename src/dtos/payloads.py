@@ -42,3 +42,5 @@ class LogEventDTO:
     color: int
     moderator_id: Optional[int] = None
     user_id: Optional[int] = None
+    case_number: Optional[int] = None
+    metadata: Optional[dict] = None

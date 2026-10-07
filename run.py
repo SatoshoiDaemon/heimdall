@@ -1,16 +1,20 @@
-import asyncio
-from src.core.logger import setup_logger
-from src.core.config import config
-from src.core.bot import ModBot
 import sys
+
+from src.core.config import config
+from src.core.exceptions import ConfigurationError
+from src.core.logger import setup_logger
 
 def main():
     logger = setup_logger()
-    logger.info("Starting up Bot1 ModBot...")
+    logger.info("Starting up Heimdall...")
 
-    if not config.BOT_TOKEN:
-        logger.critical("BOT_TOKEN is not set in the environment variables.")
+    try:
+        config.validate()
+    except ConfigurationError as error:
+        logger.critical("Invalid configuration: %s", error)
         sys.exit(1)
+
+    from src.core.bot import ModBot
 
     bot = ModBot()
 
@@ -19,8 +23,8 @@ def main():
         bot.run(config.BOT_TOKEN, log_handler=None) # We already setup our custom logger
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down.")
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}")
+    except Exception:
+        logger.exception("Fatal error while running Heimdall.")
         
 if __name__ == "__main__":
     main()
