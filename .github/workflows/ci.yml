@@ -1,11 +1,12 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -13,26 +14,70 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: requirements-dev.txt
-
-      - name: Install dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
-
-      - name: Lint
-        run: python -m ruff check .
-
-      - name: Compile Python sources
-        run: python -m compileall -q run.py src tests
-
-      - name: Run tests
-        run: python -m pytest
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m ruff check . && python -m ruff format --check .
+      - run: python -m mypy
+      - run: python -m compileall -q run.py src tests scripts
+      - run: python -m pytest -m 'not integration' --cov --cov-report=term-missing --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mongo-mode: [standalone, replica]
+    env:
+      MONGO_MODE: ${{ matrix.mongo-mode }}
+      TEST_MONGO_URI: mongodb://localhost:27017
+      HEIMDALL_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Start a MongoDB test instance
+        run: |
+          mkdir -p "$RUNNER_TEMP/mongo-bin" "$RUNNER_TEMP/mongo-data"
+          curl --fail --retry 3 --location https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2204-7.0.16.tgz | tar -xz --no-same-owner --strip-components=1 -C "$RUNNER_TEMP/mongo-bin"
+          mongo_args=()
+          if [ "$MONGO_MODE" = replica ]; then mongo_args+=(--replSet rs0); fi
+          "$RUNNER_TEMP/mongo-bin/bin/mongod" --dbpath "$RUNNER_TEMP/mongo-data" --bind_ip 127.0.0.1 --port 27017 --logpath "$RUNNER_TEMP/mongo.log" --fork "${mongo_args[@]}"
+          python scripts/init_test_mongo.py
+      - name: Test against MongoDB
+        run: python -m pytest -m integration -v
+      - name: MongoDB diagnostic log
+        if: failure()
+        run: cat "$RUNNER_TEMP/mongo.log"
+  source-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Clean production installation from source
+        run: |
+          python -m venv "$RUNNER_TEMP/runtime"
+          "$RUNNER_TEMP/runtime/bin/python" -m pip install -r requirements.txt
+          "$RUNNER_TEMP/runtime/bin/python" -c 'from src.core.bot import ModBot; from src.version import __version__; print(__version__)'
+      - name: Missing token exits with a configuration error
+        run: |
+          set +e
+          env -u BOT_TOKEN "$RUNNER_TEMP/runtime/bin/python" run.py > startup.log 2>&1
+          status=$?
+          set -e
+          cat startup.log
+          test "$status" = 1
+          python -c 'assert "BOT_TOKEN is required" in open("startup.log").read()'

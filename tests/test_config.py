@@ -9,7 +9,6 @@ def valid_environment(**overrides):
         "BOT_TOKEN": "test-token",
         "MONGO_URI": "mongodb://localhost:27017",
         "MONGO_DB_NAME": "heimdall_test",
-        "REDIS_URI": "redis://localhost:6379/0",
     }
     values.update(overrides)
     return values
@@ -22,7 +21,7 @@ def test_valid_configuration():
     assert config.CAPTCHA_TIMEOUT_SECONDS == 300
 
 
-@pytest.mark.parametrize("missing", ["BOT_TOKEN", "MONGO_URI", "MONGO_DB_NAME", "REDIS_URI"])
+@pytest.mark.parametrize("missing", ["BOT_TOKEN", "MONGO_URI", "MONGO_DB_NAME"])
 def test_required_configuration_is_enforced(missing):
     environment = valid_environment()
     environment.pop(missing)

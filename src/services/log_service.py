@@ -1,92 +1,217 @@
 import asyncio
-import json
 import logging
-from src.core.redis_client import RedisClient
-from src.dtos.payloads import LogEventDTO
-from src.core.config import config
-from src.core.event_bus import EventBus
+import uuid
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
+from time import perf_counter
+
 import discord
-from discord.ext import commands
+from pymongo import ReturnDocument
+
+from src.core.config import config
+from src.core.database import Database, _session
+from src.core.event_bus import EventBus
+from src.core.metrics import counters, observe
+from src.dtos.payloads import LogEventDTO
 
 log = logging.getLogger("modbot.logworker")
 
+
 class LogService:
-    QUEUE_KEY = "modbot:log_queue"
+    QUEUE_SIZE = 1000
+    _queue: asyncio.Queue | None = None
+    _scheduled: set[str] = set()
+
+    @classmethod
+    def reset_queue(cls):
+        cls._queue = asyncio.Queue(maxsize=cls.QUEUE_SIZE)
+        cls._scheduled = set()
+
+    @classmethod
+    def schedule(cls, event_id):
+        if cls._queue is None:
+            cls.reset_queue()
+        if event_id in cls._scheduled:
+            return
+        try:
+            cls._queue.put_nowait(event_id)
+            cls._scheduled.add(event_id)
+        except asyncio.QueueFull:
+            # The record is already durable. The next scan will pick it up.
+            counters["audit_queue_full"] += 1
+
+    MAX_ATTEMPTS = 5
 
     @staticmethod
-    async def enqueue_log(dto: LogEventDTO):
-        conn = RedisClient.redis_conn
-        await conn.lpush(LogService.QUEUE_KEY, json.dumps(dto.__dict__))
+    async def enqueue_log(dto: LogEventDTO, event_id: str | None = None):
+        # Mongo outbox is authoritative; the local queue is bounded and disposable.
+        # Case transactions
+        # write the outbox in the same transaction as their projections/state.
+        event_id = event_id or uuid.uuid4().hex
+        await Database.db.audit_outbox.update_one(
+            {"_id": event_id},
+            {
+                "$setOnInsert": {
+                    "payload": asdict(dto),
+                    "delivered": False,
+                    "attempts": 0,
+                    "created_at": datetime.now(UTC),
+                    "next_attempt": datetime.now(UTC),
+                }
+            },
+            upsert=True,
+            session=_session.get(),
+        )
+        LogService.schedule(event_id)
+        return event_id
 
     @staticmethod
-    async def worker(bot: commands.AutoShardedBot):
-        log.info("Starting Background Log Worker...")
-        # Since this relies on resolving channels via Bot, run in a while loop
-        conn = RedisClient.redis_conn
-        
-        while not bot.is_closed():
-            try:
-                # Pop batch of logs
-                log_entries = []
-                while len(log_entries) < 20:
-                    item = await conn.rpop(LogService.QUEUE_KEY)
-                    if not item:
-                        break
-                    log_entries.append(json.loads(item))
+    async def _send(bot, event_id, payload):
+        from src.services.config_service import ConfigService
 
-                if log_entries:
-                    await LogService._process_batch(bot, log_entries)
-                
-                await asyncio.sleep(config.LOG_WORKER_INTERVAL_SECONDS)
-            except Exception as e:
-                log.error(f"Log worker error: {e}")
-                await asyncio.sleep(5)
+        settings = await ConfigService.get_guild_config(payload["guild_id"])
+        if not settings.log_channel_id:
+            # Explicit disposition; enabling logs later does not replay history.
+            return "unconfigured"
+        channel = bot.get_channel(settings.log_channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(settings.log_channel_id)
+        if getattr(channel.guild, "id", None) != payload["guild_id"]:
+            raise ValueError("Audit channel belongs to another guild")
+        embed = discord.Embed(
+            title=payload["event_type"][:256],
+            description=payload["description"][:3500],
+            color=payload["color"],
+        )
+        embed.set_footer(
+            text=f"Event {event_id} | Case {payload.get('case_number') or '-'} | Origin {(payload.get('metadata') or {}).get('origin', 'manual')}"
+        )
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        return "sent"
 
     @staticmethod
-    async def _process_batch(bot, entries):
-        # Group entries by guild to resolve config efficiently
-        # Since Services are stateless, they must resolve settings dynamically
-        from src.services.config_service import ConfigService 
-        # inline import to avoid circular dependency
-        
-        guilds_map = {}
-        for entry in entries:
-            gid = entry['guild_id']
-            if gid not in guilds_map:
-                guilds_map[gid] = []
-            guilds_map[gid].append(entry)
-            
-        for gid, log_batch in guilds_map.items():
-            g_config = await ConfigService.get_guild_config(gid)
-            if not g_config or not g_config.log_channel_id:
-                continue
-                
-            guild = bot.get_guild(gid)
-            if not guild:
-                continue
-                
-            channel = guild.get_channel(g_config.log_channel_id)
-            if not channel:
-                continue
-
-            # Batch send
-            embeds = []
-            for item in log_batch:
-                embed = discord.Embed(
-                    title=item['event_type'], 
-                    description=item['description'], 
-                    color=item['color']
+    async def deliver(bot, event_id):
+        now = datetime.now(UTC)
+        token = uuid.uuid4().hex
+        entry = await Database.db.audit_outbox.find_one_and_update(
+            {
+                "_id": event_id,
+                "delivered": False,
+                "attempts": {"$lt": LogService.MAX_ATTEMPTS},
+                "next_attempt": {"$lte": now},
+                "$or": [{"lease_until": {"$exists": False}}, {"lease_until": {"$lte": now}}],
+            },
+            {"$set": {"lease_until": now + timedelta(seconds=120), "lease_token": token}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if entry is None:
+            return False
+        started = perf_counter()
+        try:
+            # Bound delivery duration below its lease to prevent active consumers
+            # overlapping. A crash after send/before ack can still duplicate.
+            outcome = await asyncio.wait_for(
+                LogService._send(bot, event_id, entry["payload"]), timeout=90
+            )
+        except Exception as error:
+            attempts = entry["attempts"] + 1
+            counters["audit_delivery_failed"] += 1
+            await Database.db.audit_outbox.update_one(
+                {"_id": event_id, "lease_token": token},
+                {
+                    "$set": {
+                        "attempts": attempts,
+                        "last_error": str(error)[:500],
+                        "next_attempt": now + timedelta(seconds=min(300, 2**attempts)),
+                        "dead": attempts >= LogService.MAX_ATTEMPTS,
+                    },
+                    "$unset": {"lease_until": "", "lease_token": ""},
+                },
+            )
+            if attempts >= LogService.MAX_ATTEMPTS:
+                await Database.db.audit_failures.update_one(
+                    {"_id": event_id},
+                    {
+                        "$set": {
+                            "payload": entry["payload"],
+                            "error": str(error)[:500],
+                            "attempts": attempts,
+                        }
+                    },
+                    upsert=True,
                 )
-                if item.get('moderator_id'):
-                    embed.set_footer(text=f"Mod ID: {item['moderator_id']}")
-                if item.get('case_number'):
-                    embed.set_footer(text=f"Case #{item['case_number']} | Mod ID: {item.get('moderator_id', 'n/a')}")
-                embeds.append(embed)
-            
-            # Send up to 10 embeds per message (Discord limit)
-            for i in range(0, len(embeds), 10):
-                await channel.send(embeds=embeds[i:i+10])
-                await asyncio.sleep(0.5)
+            log.exception(
+                "Audit delivery failed",
+                extra={
+                    "guild_id": entry["payload"]["guild_id"],
+                    "case_id": entry["payload"].get("case_number"),
+                    "action": "audit",
+                    "outcome": "retry",
+                },
+            )
+            return False
+        await Database.db.audit_outbox.update_one(
+            {"_id": event_id, "lease_token": token},
+            {
+                "$set": {"delivered": True, "outcome": outcome, "delivered_at": datetime.now(UTC)},
+                "$unset": {"lease_until": "", "lease_token": ""},
+            },
+        )
+        observe("audit_delivered", started)
+        return True
 
-# Subscribe the enqueue function to EventBus natively
+    @staticmethod
+    async def run_once(bot):
+        if LogService._queue is None:
+            LogService.reset_queue()
+        now = datetime.now(UTC)
+        available = LogService.QUEUE_SIZE - len(LogService._scheduled)
+        if available > 0:
+            docs = (
+                await Database.db.audit_outbox.find(
+                    {
+                        "delivered": False,
+                        "attempts": {"$lt": LogService.MAX_ATTEMPTS},
+                        "next_attempt": {"$lte": now},
+                        "$or": [
+                            {"lease_until": {"$exists": False}},
+                            {"lease_until": {"$lte": now}},
+                        ],
+                    },
+                    {"_id": 1},
+                )
+                .sort("next_attempt", 1)
+                .limit(min(available, 100))
+                .to_list(length=min(available, 100))
+            )
+            for entry in docs:
+                LogService.schedule(entry["_id"])
+        for _ in range(20):
+            try:
+                event_id = LogService._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                await LogService.deliver(bot, event_id)
+            finally:
+                LogService._scheduled.discard(event_id)
+                LogService._queue.task_done()
+        counters["audit_pending"] = await Database.db.audit_outbox.count_documents(
+            {"delivered": False, "dead": {"$ne": True}}
+        )
+        counters["audit_dead"] = await Database.db.audit_outbox.count_documents({"dead": True})
+        counters["audit_queue_size"] = LogService._queue.qsize()
+
+    @staticmethod
+    async def worker(bot):
+        await bot.wait_until_ready()
+        while not bot.is_closed():
+            if bot.is_ready():
+                try:
+                    await LogService.run_once(bot)
+                except Exception:
+                    log.exception("Audit worker unavailable; Mongo records retained for retry")
+            await asyncio.sleep(config.LOG_WORKER_INTERVAL_SECONDS)
+
+
 EventBus.subscribe("audit_log", LogService.enqueue_log)

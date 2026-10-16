@@ -1,6 +1,9 @@
+from typing import Any
+
 from motor.motor_asyncio import AsyncIOMotorCollection
-from typing import Any, Dict, List, Optional
-from src.core.database import Database
+
+from src.core.database import Database, _session
+
 
 class BaseRepository:
     def __init__(self, collection_name: str):
@@ -10,26 +13,34 @@ class BaseRepository:
     def col(self) -> AsyncIOMotorCollection:
         return Database.db[self.collection_name]
 
-    async def insert_one(self, document: Dict[str, Any]) -> str:
-        res = await self.col.insert_one(document)
+    async def insert_one(self, document: dict[str, Any]) -> str:
+        res = await self.col.insert_one(document, session=_session.get())
         return str(res.inserted_id)
 
-    async def find_one(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        return await self.col.find_one(query)
+    async def find_one(self, query: dict[str, Any]) -> dict[str, Any] | None:
+        return await self.col.find_one(query, session=_session.get())
 
-    async def find_many(self, query: Dict[str, Any], limit: int = 0) -> List[Dict[str, Any]]:
-        cursor = self.col.find(query)
+    async def find_many(self, query: dict[str, Any], limit: int = 0) -> list[dict[str, Any]]:
+        cursor = self.col.find(query, session=_session.get())
         if limit > 0:
             cursor = cursor.limit(limit)
         return await cursor.to_list(length=None)
 
-    async def update_one(self, query: Dict[str, Any], update: Dict[str, Any], upsert: bool = False) -> int:
-        res = await self.col.update_one(query, update, upsert=upsert)
+    async def update_one(
+        self, query: dict[str, Any], update: dict[str, Any], upsert: bool = False
+    ) -> int:
+        res = await self.col.update_one(query, update, upsert=upsert, session=_session.get())
         return res.modified_count
 
-    async def delete_many(self, query: Dict[str, Any]) -> int:
-        res = await self.col.delete_many(query)
+    async def delete_many(self, query: dict[str, Any]) -> int:
+        res = await self.col.delete_many(query, session=_session.get())
         return res.deleted_count
 
-    async def count(self, query: Dict[str, Any]) -> int:
+    async def count(self, query: dict[str, Any]) -> int:
         return await self.col.count_documents(query)
+
+    async def find_page(self, query: dict, page: int, page_size: int = 5):
+        if page < 1 or not 1 <= page_size <= 100:
+            raise ValueError("Invalid pagination.")
+        cursor = self.col.find(query).sort([("case_number", -1), ("_id", -1)])
+        return await cursor.skip((page - 1) * page_size).limit(page_size).to_list(length=page_size)
