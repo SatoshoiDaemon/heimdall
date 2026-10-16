@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import discord
 
-from src.core.database import Database
+from src.core.database import Database, _session
 from src.core.exceptions import (
     CaseNotFound,
     InvalidCase,
@@ -95,6 +95,17 @@ class ModerationService:
             previous = await cls.case_repo.find_one({"operation_id": operation_id})
             if previous:
                 return Case(**previous)
+        pending = await cls.case_repo.find_one(
+            {
+                "guild_id": data["guild_id"],
+                "target_user_id": data.get("target_user_id"),
+                "status": {"$in": ["pending", "applying", "applied", "uncertain"]},
+            }
+        )
+        if pending:
+            raise ModerationError(
+                f"Case #{pending['case_number']} must be recovered or reviewed before another action."
+            )
         return await cls.case_repo.create_case(
             **data,
             status="pending",
@@ -134,6 +145,29 @@ class ModerationService:
                 },
                 upsert=True,
             )
+        if case.action in {"BAN", "TIMEOUT"}:
+            await cls.case_repo.col.update_many(
+                {
+                    "guild_id": case.guild_id,
+                    "target_user_id": case.target_user_id,
+                    "action": case.action,
+                    "case_number": {"$lt": case.case_number},
+                    "active": True,
+                },
+                {"$set": {"active": False}},
+                session=_session.get(),
+            )
+            if case.action == "TIMEOUT":
+                await cls.punish_repo.col.update_many(
+                    {
+                        "guild_id": case.guild_id,
+                        "user_id": case.target_user_id,
+                        "type": "timeout",
+                        "case_number": {"$lt": case.case_number},
+                    },
+                    {"$set": {"active": False}},
+                    session=_session.get(),
+                )
         if case.related_case_number:
             await cls.case_repo.revoke(case.guild_id, case.related_case_number)
             if case.action == "UNWARN":
@@ -171,6 +205,7 @@ class ModerationService:
                 },
             )
         case.status = "completed"
+        case.active = case.action in {"WARN", "BAN", "TIMEOUT"}
         counters["case_completed"] += 1
         log.info(
             "Moderation case completed",

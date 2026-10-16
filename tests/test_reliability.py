@@ -422,3 +422,81 @@ async def test_config_revision_ignores_stale_cache(backend):
     assert (await ConfigService.get_guild_config(1)).anti_spam_enabled
     with pytest.raises(ValueError):
         await ConfigService.update_guild_config(1, {"spam_threshold_score": 0})
+
+
+@pytest.mark.asyncio
+async def test_pending_action_blocks_newer_action_until_recovered(backend, monkeypatch):
+    guild, target, moderator, _, _ = make_guild()
+    original = Mod._finish
+    monkeypatch.setattr(Mod, "_finish", AsyncMock(side_effect=RuntimeError("interrupted")))
+    with pytest.raises(RuntimeError):
+        await Mod.timeout(guild, target, moderator.id, 600, "first")
+    monkeypatch.setattr(Mod, "_finish", original)
+    with pytest.raises(ModerationError, match="recovered or reviewed"):
+        await Mod.timeout(guild, target, moderator.id, 60, "second")
+    target.timeout.assert_awaited_once()
+    await Mod.reconcile(SimpleNamespace(get_guild=lambda _: guild))
+    newer = await Mod.timeout(guild, target, moderator.id, 60, "second")
+    assert newer.status == "completed"
+    assert target.timeout.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_new_timeout_supersedes_previous_case(backend):
+    guild, target, moderator, _, _ = make_guild()
+    older = await Mod.timeout(guild, target, moderator.id, 60, "old")
+    newer = await Mod.timeout(guild, target, moderator.id, 120, "new")
+    assert not (await Mod.get_case(1, older.case_number)).active
+    assert (
+        await Mod.case_repo.get_latest_active(1, target.id, "TIMEOUT")
+    ).case_number == newer.case_number
+    with pytest.raises(ModerationError):
+        await Mod.untimeout(guild, target, moderator.id, older.case_number, "old reversal")
+    reversal = await Mod.untimeout(guild, target, moderator.id, newer.case_number, "remove")
+    repeated = await Mod.untimeout(guild, target, moderator.id, newer.case_number, "remove")
+    assert reversal.case_number == repeated.case_number
+    assert target.timeout.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_legacy_audit_queue_is_migrated_without_loss(backend):
+    import json
+    from dataclasses import asdict
+
+    db, redis = backend
+    raw = json.dumps(asdict(LogEventDTO(1, "legacy", "test", 0)))
+    await redis.lpush("modbot:log_queue", raw, raw)
+    await LogService.migrate_legacy()
+    assert await db.audit_outbox.count_documents({}) == 2
+    assert await redis.llen("modbot:log_queue") == 0
+    assert await redis.llen("modbot:log_queue:migrating") == 0
+
+
+@pytest.mark.asyncio
+async def test_config_callbacks_revalidate_revoked_permission(backend):
+    from src.cogs.config_ui import ConfigView
+
+    guild, _, moderator, _, _ = make_guild()
+    moderator.guild_permissions = discord.Permissions.none()
+    settings = await ConfigService.get_guild_config(guild.id)
+    view = ConfigView(settings, moderator.id)
+    interaction = SimpleNamespace(
+        guild=guild,
+        guild_id=guild.id,
+        user=moderator,
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+    assert not await view.interaction_check(interaction)
+    interaction.response.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_captcha_rejects_elevated_verified_role(backend):
+    _, redis = backend
+    guild, member, _, role, _ = make_guild()
+    role.permissions = discord.Permissions(manage_messages=True)
+    await ConfigService.update_guild_config(guild.id, {"verified_role_id": role.id})
+    await redis.hset("captcha:1:10", mapping={"code": "ABCDEF"})
+    with pytest.raises(ModerationError, match="elevated"):
+        await CaptchaService.complete(guild, member, "ABCDEF")
+    member.add_roles.assert_not_awaited()
