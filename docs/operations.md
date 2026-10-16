@@ -24,6 +24,9 @@ Expulsões e purges com estado `applying` após crash ficam `uncertain`. Revise
 `/case`, o audit log Discord e os efeitos reais antes de intervir no banco:
 se confirmar que a ação ocorreu, marque `status: applied` para concluir só a
 persistência; se confirmar que não ocorreu, marque `pending` para repetir.
+Casos pendentes ou incertos bloqueiam novas ações no mesmo alvo até a resolução;
+a recuperação nunca reaplica uma punição antiga após uma nova. Timeouts
+expirados têm suas projeções marcadas como inativas pelo worker.
 Nunca reinicie um purge sem conferir o efeito anterior.
 
 ## Auditoria

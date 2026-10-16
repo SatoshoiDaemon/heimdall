@@ -64,7 +64,9 @@ class LogService:
             description=payload["description"][:3500],
             color=payload["color"],
         )
-        embed.set_footer(text=f"Event {event_id} | Case {payload.get('case_number') or '-'}")
+        embed.set_footer(
+            text=f"Event {event_id} | Case {payload.get('case_number') or '-'} | Origin {(payload.get('metadata') or {}).get('origin', 'manual')}"
+        )
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         return "sent"
 

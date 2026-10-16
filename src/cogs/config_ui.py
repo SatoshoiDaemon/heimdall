@@ -1,9 +1,9 @@
-import json
-
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from src.cogs.moderation import PaginationView
+from src.core.database import Database
 from src.core.event_bus import EventBus
 from src.dtos.payloads import LogEventDTO
 from src.middlewares.rbac_check import check_permission, has_permissions
@@ -262,6 +262,19 @@ class ConfigView(discord.ui.View):
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
 
+class RBACView(PaginationView):
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id or not (
+            interaction.user.id == interaction.guild.owner_id
+            or interaction.user.guild_permissions.administrator
+        ):
+            await interaction.response.send_message(
+                "Discord administrator access required.", ephemeral=True
+            )
+            return False
+        return True
+
+
 class ConfigUI(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -302,19 +315,54 @@ class ConfigUI(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         if operation in {"list", "effective"}:
             query = {"guild_id": interaction.guild_id}
-            if operation == "effective" and member:
+            if operation == "effective":
+                if member is None:
+                    await interaction.followup.send(
+                        "Choose a member for effective permissions.", ephemeral=True
+                    )
+                    return
                 query["$or"] = [
                     {"user_id": member.id},
                     {"role_id": {"$in": [r.id for r in member.roles]}},
                 ]
-            docs = await RBACService.repo.find_many(query, limit=100)
-            result = [{k: v for k, v in d.items() if k != "_id"} for d in docs]
-            description = json.dumps(result, indent=2)
-            if member and operation == "effective":
-                description += f"\nNative permissions: {member.guild_permissions.value}; admin/owner: {member.guild_permissions.administrator or member.id == interaction.guild.owner_id}"
-            await interaction.followup.send(
-                description[:1900] or "No grants configured.", ephemeral=True
-            )
+            docs = await RBACService.repo.find_many(query)
+            if operation == "effective":
+                grants = {c for d in docs for c in d.get("allowed_commands", [])}
+                native = {
+                    "ban": "ban_members",
+                    "unban": "ban_members",
+                    "kick": "kick_members",
+                    "purge": "manage_messages",
+                    "config": "manage_guild",
+                }
+                effective = []
+                admin = (
+                    member.id == interaction.guild.owner_id
+                    or member.guild_permissions.administrator
+                )
+                for command in sorted(COMMANDS - {"*"}):
+                    if (
+                        admin
+                        or "*" in grants
+                        or command in grants
+                        or getattr(
+                            member.guild_permissions, native.get(command, "moderate_members"), False
+                        )
+                    ):
+                        effective.append(command)
+                lines = [
+                    f"**{member}**\nAllowed commands: {', '.join(effective) or 'none'}\n"
+                    f"RBAC grants: {', '.join(sorted(grants)) or 'none'}\nRole hierarchy still applies."
+                ]
+            else:
+                lines = [
+                    f"**{d['type']} {d.get('user_id') or d.get('role_id')}**\n"
+                    + (", ".join(d.get("allowed_commands", [])) or "No grants")
+                    for d in docs
+                ]
+            view = RBACView("Heimdall permissions", lines)
+            view.owner_id = interaction.user.id
+            await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
             return
         if bool(member) == bool(role) or permission not in COMMANDS:
             await interaction.followup.send(
@@ -348,8 +396,9 @@ class ConfigUI(commands.Cog):
             else:
                 await interaction.followup.send("Unknown operation.", ephemeral=True)
                 return
-            await setter(interaction.guild_id, target_id, sorted(current))
-            await audit_change(interaction, f"RBAC {operation}: {permission} for {target_id}")
+            async with Database.transaction():
+                await setter(interaction.guild_id, target_id, sorted(current))
+                await audit_change(interaction, f"RBAC {operation}: {permission} for {target_id}")
         await interaction.followup.send("Permissions updated.", ephemeral=True)
 
 

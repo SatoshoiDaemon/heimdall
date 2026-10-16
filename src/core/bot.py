@@ -92,6 +92,7 @@ class ModBot(commands.AutoShardedBot):
                 await Database.db.command("ping")
                 await RedisClient.redis_conn.ping()
                 await ModerationService.reconcile(self)
+                await ModerationService.expire_timeouts()
                 Path("/tmp/heimdall-health.json").write_text(
                     json.dumps({"at": time(), **snapshot()})
                 )

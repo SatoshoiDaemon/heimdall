@@ -285,7 +285,7 @@ class ModerationService:
                         await channel.get_partial_message(case.metadata["message_id"]).delete()
                     except discord.NotFound:
                         pass
-            except discord.Forbidden as error:
+            except (discord.Forbidden, discord.NotFound, ModerationError) as error:
                 await cls.case_repo.update_one(
                     {"operation_id": case.operation_id},
                     {"$set": {"status": "failed", "error": str(error)[:500]}},
@@ -307,6 +307,27 @@ class ModerationService:
                 {"operation_id": case.operation_id}, {"$set": {"status": "applied"}}
             )
         return await cls._finish(case)
+
+    @classmethod
+    async def expire_timeouts(cls):
+        now = datetime.now(UTC)
+        docs = await cls.case_repo.col.find(
+            {
+                "action": "TIMEOUT",
+                "status": "completed",
+                "active": True,
+                "metadata.until": {"$lte": now.isoformat()},
+            }
+        ).to_list(length=100)
+        for doc in docs:
+            case = Case(**doc)
+            async with LockService.get_lock(f"lock:user:{case.guild_id}:{case.target_user_id}"):
+                async with Database.transaction():
+                    await cls.case_repo.update_one(
+                        {"guild_id": case.guild_id, "case_number": case.case_number},
+                        {"$set": {"active": False}},
+                    )
+                    await cls.punish_repo.mark_inactive_by_case(case.guild_id, case.case_number)
 
     @classmethod
     async def reconcile(cls, bot):

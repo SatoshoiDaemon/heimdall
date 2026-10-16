@@ -148,3 +148,35 @@ async def test_failed_http_delivery_retries_without_loss(services, monkeypatch):
     )
     await LogService.run_once(None, "worker-after-restart")
     assert (await db.audit_outbox.find_one({"_id": event_id}))["delivered"]
+
+
+async def test_legacy_list_claim_and_migration_on_real_redis(services):
+    import json
+    from dataclasses import asdict
+
+    db, redis = services
+    raw = json.dumps(asdict(LogEventDTO(1, "legacy", "duplicate payloads are separate events", 0)))
+    await redis.lpush("modbot:log_queue", raw, raw)
+    await LogService.migrate_legacy()
+    assert await db.audit_outbox.count_documents({}) == 2
+    assert await redis.llen("modbot:log_queue:migrating") == 0
+    assert await redis.llen("modbot:log_queue") == 0
+
+
+async def test_connection_failure_is_explicit_and_does_not_punish(services, monkeypatch):
+    from src.core.exceptions import ModBotException
+
+    failed = Redis.from_url(
+        "redis://127.0.0.1:1/0",
+        decode_responses=True,
+        socket_connect_timeout=0.2,
+        socket_timeout=0.2,
+    )
+    monkeypatch.setattr(RedisClient, "redis_conn", failed)
+    try:
+        assert not await AntiAbuseService.track_spam(SpamEventDTO(1, 2, 3, 4, "test"), 1, 60)
+        with pytest.raises(ModBotException, match="Redis is unavailable"):
+            async with LockService.get_lock("unreachable"):
+                pytest.fail("must fail closed")
+    finally:
+        await failed.aclose()

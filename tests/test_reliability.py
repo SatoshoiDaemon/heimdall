@@ -500,3 +500,48 @@ async def test_captcha_rejects_elevated_verified_role(backend):
     with pytest.raises(ModerationError, match="elevated"):
         await CaptchaService.complete(guild, member, "ABCDEF")
     member.add_roles.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_timeout_expiry_marks_case_and_projection_inactive(backend):
+    db, _ = backend
+    guild, target, moderator, _, _ = make_guild()
+    case = await Mod.timeout(guild, target, moderator.id, 60, "temporary")
+    await db.cases.update_one(
+        {"case_number": case.case_number},
+        {"$set": {"metadata.until": (datetime.now(UTC) - timedelta(seconds=1)).isoformat()}},
+    )
+    await Mod.expire_timeouts()
+    assert not (await Mod.get_case(1, case.case_number)).active
+    assert not (await db.punishments.find_one({"case_number": case.case_number}))["active"]
+
+
+@pytest.mark.asyncio
+async def test_event_detection_dispatches_to_consumer_and_case(backend):
+    from src.cogs.events import EventListener
+
+    db, _ = backend
+    guild, target, _, _, channel = make_guild()
+    await ConfigService.update_guild_config(
+        1,
+        {
+            "blocked_words": ["blocked"],
+            "automod_rules": {"words": {"enabled": True, "action": "warn"}},
+        },
+    )
+    cog = EventListener(None)
+    await cog.cog_load()
+    message = SimpleNamespace(
+        id=1000,
+        guild=guild,
+        author=target,
+        channel=channel,
+        content="blocked",
+        mentions=[],
+        role_mentions=[],
+        mention_everyone=False,
+    )
+    await cog.on_message(message)
+    await cog.cog_unload()
+    case = await db.cases.find_one({})
+    assert case["origin"] == "automatic" and case["status"] == "completed"

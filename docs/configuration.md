@@ -58,8 +58,8 @@ Um administrador só pode alterar concessões de membros/cargos abaixo de si.
 /rbac operation:list
 ```
 
-A consulta efetiva mostra grants do usuário e de seus cargos, além do bitfield
-de permissões nativas. Revogar um grant não remove permissões nativas nem
+A consulta efetiva combina grants do usuário, seus cargos e permissões nativas
+e mostra os comandos liberados. As listagens têm navegação por páginas. Revogar um grant não remove permissões nativas nem
 grants de outros cargos. `*` libera os comandos sujeitos a RBAC, respeitando
 sempre a hierarquia.
 
