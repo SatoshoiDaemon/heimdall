@@ -151,7 +151,7 @@ class LogService:
                     """
                     local raw = redis.call('RPOP', KEYS[1])
                     if not raw then return false end
-                    local wrapped = cjson.encode({event_id=ARGV[1], raw=raw})
+                    local wrapped = ARGV[1] .. ':' .. raw
                     redis.call('LPUSH', KEYS[2], wrapped)
                     return wrapped
                 """,
@@ -163,14 +163,14 @@ class LogService:
             if not item:
                 return
             try:
-                wrapped = json.loads(item)
-                dto = LogEventDTO(**json.loads(wrapped["raw"]))
+                event_id, raw = item.split(":", 1)
+                dto = LogEventDTO(**json.loads(raw))
             except (ValueError, TypeError, KeyError):
                 await conn.lpush("modbot:legacy_log_failures", item)
                 await conn.lrem(processing, 1, item)
                 log.error("Malformed legacy audit entry preserved in Redis failure queue")
                 continue
-            await LogService.enqueue_log(dto, event_id=wrapped["event_id"])
+            await LogService.enqueue_log(dto, event_id=event_id)
             await conn.lrem(processing, 1, item)
 
     @staticmethod
