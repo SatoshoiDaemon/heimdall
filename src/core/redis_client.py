@@ -1,8 +1,11 @@
-import redis.asyncio as redis
-from src.core.config import config
 import logging
 
+import redis.asyncio as redis
+
+from src.core.config import config
+
 log = logging.getLogger("modbot.redis")
+
 
 class RedisClient:
     redis_conn: redis.Redis = None

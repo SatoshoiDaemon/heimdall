@@ -41,7 +41,7 @@ class FakeConfigRepository:
 
     async def update_one(self, query, update, upsert=False):
         document = self.documents.get(query["guild_id"], {"_id": "generated-id", **query})
-        document.update(update["$set"])
+        document.update(update.get("$set", update.get("$setOnInsert", {})))
         self.documents[query["guild_id"]] = document
 
 
@@ -68,4 +68,4 @@ async def test_config_service_creates_and_caches_default(monkeypatch):
 
     assert isinstance(config, GuildConfig)
     assert cached.guild_id == 123
-    assert await redis.get("config:123") is not None
+    assert await redis.get("config:123:0") is not None

@@ -1,109 +1,93 @@
 # Heimdall
 
-Heimdall é um bot de Discord focado em moderação e gerenciamento de membros.
-O projeto está sendo desenvolvido em Python com uma arquitetura assíncrona e
-separação entre comandos, serviços, repositórios e infraestrutura.
+Bot open source de moderação para Discord, em Python, MongoDB e Redis.
+Versão de desenvolvimento: **0.2.0rc1**. A publicação estável depende dos
+critérios em [docs/releasing.md](docs/releasing.md).
 
-## Estado atual
+## Recursos
 
-Esta é a fundação inicial do projeto. Já existem componentes para configuração
-por servidor, auditoria, antiabuso, CAPTCHA, RBAC, MongoDB e Redis. A moderação
-manual agora inclui advertências, banimentos, expulsões, timeout, purge, notas,
-cases e histórico. O painel central com Components V2, o AutoMod configurável e
-a engine de automações serão desenvolvidos nas próximas fases.
+- Advertências, bans, expulsões, timeouts, purge, notas e cases por servidor.
+- AutoMod com regras de spam ponderado, repetição, menções, palavras, URLs e
+  convites; ações individuais de advertência, exclusão ou timeout.
+- CAPTCHA que concede o cargo configurado, com sessão recuperável em falhas.
+- Painel `/config` por categorias e `/rbac` para administrar permissões.
+- Histórico paginado no banco com filtros por usuário, moderador, ação,
+  origem e período.
+- Intenções persistentes, transações em replica sets, reconciliação após
+  reinícios e auditoria com outbox, Redis Streams, confirmação e fila de falhas.
+- Docker sem root, Compose, logs JSON, métricas e healthcheck.
 
-Ficam fora do escopo do Heimdall anti-raid, análise de intenção, IA para decidir
-punições e qualquer tentativa de transformá-lo em um sistema de segurança
-coordenada.
+O foco é moderação determinística. Anti-raid, inferência de intenção e punições
+por IA ficam fora do escopo.
 
-## Requisitos
+## Iniciar
 
-- Python 3.11, 3.12 ou 3.13
-- MongoDB
-- Redis
-- Um bot criado no [Discord Developer Portal](https://discord.com/developers/applications)
+Crie uma aplicação no [Discord Developer Portal](https://discord.com/developers/applications).
+Habilite **Server Members Intent** e **Message Content Intent** e convide o bot
+com os escopos `bot` e `applications.commands`.
 
-O bot precisa dos intents `Server Members Intent` e `Message Content Intent`
-habilitados no Developer Portal para os recursos atuais.
-
-## Instalação local
-
-```bash
-git clone git@github.com:SatoshoiDaemon/heimdall.git
+```sh
+git clone https://github.com/SatoshoiDaemon/heimdall.git
 cd heimdall
-
-python -m venv .venv
-source .venv/bin/activate  # Linux/macOS
-# .venv\\Scripts\\activate  # Windows
-
-python -m pip install -r requirements-dev.txt
 cp .env.example .env
+# Preencha BOT_TOKEN em .env.
+docker compose up -d --build
 ```
 
-Preencha `.env` com valores reais antes de iniciar o bot. O arquivo `.env` é
-ignorado pelo Git e nunca deve ser publicado.
+O Compose inicia MongoDB em replica set e Redis com persistência AOF, sem
+publicar portas dos bancos. Após o bot conectar, abra `/config`, escolha o canal
+de auditoria e o cargo de verificado e configure as regras do AutoMod.
 
-## Configuração
+Para execução local e permissões, veja [instalação](docs/installation.md).
+Para regras, exemplos e diagnóstico, veja [configuração](docs/configuration.md).
 
-Variáveis obrigatórias:
+## Comandos
 
-```dotenv
-BOT_TOKEN=seu_token
-MONGO_URI=mongodb://localhost:27017
-MONGO_DB_NAME=heimdall
-REDIS_URI=redis://localhost:6379/0
-```
+| Área | Comandos |
+| --- | --- |
+| Advertências | `/warn`, `/warnings`, `/unwarn` |
+| Punições | `/ban`, `/unban`, `/kick`, `/timeout`, `/untimeout`, `/mute`, `/unmute` |
+| Organização | `/purge`, `/note`, `/notes` |
+| Auditoria | `/history`, `/case` |
+| Administração | `/config`, `/rbac` |
+| Verificação | `/manual_verify`, `/solve_captcha` |
 
-Variáveis opcionais:
+`mute` usa o timeout nativo do Discord. Consultas de moderação são efêmeras.
+Permissões nativas ou RBAC liberam comandos; a hierarquia continua obrigatória,
+inclusive para administradores. O dono ignora apenas a própria comparação de
+cargo; nunca a hierarquia do bot. Administradores não podem receber timeout.
 
-```dotenv
-CAPTCHA_TIMEOUT_SECONDS=300
-LOG_WORKER_INTERVAL_SECONDS=5
-# GUILD_ID=123456789012345678
-```
+## Desenvolvimento
 
-O processo valida a configuração antes de tentar conectar aos serviços. Valores
-ausentes ou inválidos fazem o processo terminar com uma mensagem objetiva.
+Python 3.11–3.13:
 
-## Execução
-
-```bash
-python run.py
-```
-
-## Testes e qualidade
-
-```bash
-python -m pytest
+```sh
+python -m pip install -r requirements-dev.txt
 python -m ruff check .
-python -m compileall -q run.py src tests
+python -m ruff format --check .
+python -m mypy
+python -m pytest -m 'not integration' --cov
 ```
 
-A CI do GitHub Actions executa esses checks em pull requests e em pushes para
-`main`, usando Python 3.11, 3.12 e 3.13.
+A CI também executa testes de integração com MongoDB replica set e Redis reais,
+constrói a imagem e verifica o usuário sem root. Instruções completas em
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Moderação manual
+## Garantias operacionais
 
-O Cog de moderação disponibiliza `/warn`, `/unwarn`, `/warnings`, `/ban`,
-`/unban`, `/kick`, `/timeout`, `/untimeout`, `/mute`, `/unmute`, `/purge`,
-`/note`, `/notes`, `/history` e `/case`.
+Os cases são a fonte de verdade. Uma ação externa recebe intenção persistente
+antes de ser enviada ao Discord. Operações idempotentes e projeções incompletas
+são recuperadas pelo worker. Purges e expulsões interrompidos em ponto ambíguo
+ficam como `uncertain` para revisão, evitando repetição destrutiva.
 
-As ações são registradas em cases numerados por servidor. `mute` é um alias de
-timeout e as operações reversíveis criam um novo case relacionado ao case
-original. Consultas e notas são respondidas de forma efêmera para moderadores.
+A auditoria tem entrega **pelo menos uma vez**: falha entre envio e confirmação
+pode repetir uma mensagem, identificada pelo mesmo ID. Após cinco falhas, o
+registro permanece na outbox com `dead=true` e na coleção `audit_failures`.
+Eventos sem canal configurado recebem resultado `unconfigured`.
 
-## Estrutura
-
-- `src/cogs/`: comandos e listeners do Discord.
-- `src/core/`: configuração, bot, conexões, eventos e logs.
-- `src/dtos/`: objetos de transferência internos.
-- `src/middlewares/`: verificações de acesso.
-- `src/models/`: modelos de domínio e documentos MongoDB.
-- `src/repositories/`: acesso às coleções persistentes.
-- `src/services/`: regras de negócio e integrações.
-- `src/utils/`: utilitários de apresentação.
-- `tests/`: testes unitários sem dependência de serviços externos.
+Consulte [operação e recuperação](docs/operations.md) para estados, fila de
+falhas, métricas, migração e limites.
 
 ## Licença
 
-Distribuído sob a licença MIT. Consulte [LICENSE](LICENSE).
+[MIT](LICENSE).

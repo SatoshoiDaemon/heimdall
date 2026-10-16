@@ -1,33 +1,66 @@
-import uuid
+import asyncio
 import contextlib
-from src.core.redis_client import RedisClient
+import uuid
+
+from redis.exceptions import RedisError
+
 from src.core.exceptions import ModBotException
+from src.core.redis_client import RedisClient
+
 
 class LockService:
     @staticmethod
     @contextlib.asynccontextmanager
-    async def get_lock(resource_key: str, timeout: int = 10):
-        """
-        Distributed lock using Redis SET NX.
-        Used to prevent race conditions during /warn, /purge or /captcha.
-        """
-        token = str(uuid.uuid4())
-        redis_conn = RedisClient.redis_conn
-        
-        # Try to acquire lock
-        acquired = await redis_conn.set(resource_key, token, nx=True, ex=timeout)
+    async def get_lock(resource_key: str, timeout: int = 120):
+        """Renewed lease. Losing Redis cancels the owner, never runs unlocked."""
+        token = uuid.uuid4().hex
+        conn = RedisClient.redis_conn
+        try:
+            acquired = await conn.set(resource_key, token, nx=True, ex=timeout)
+        except RedisError as error:
+            raise ModBotException("Redis is unavailable; retry this operation later.") from error
         if not acquired:
-            raise ModBotException(f"Resource {resource_key} is currently locked by another process.")
-            
+            raise ModBotException("This resource is busy. Retry shortly.")
+        owner = asyncio.current_task()
+        lost = False
+
+        async def renew():
+            nonlocal lost
+            try:
+                while True:
+                    await asyncio.sleep(timeout / 3)
+                    renewed = await conn.eval(
+                        "if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('expire',KEYS[1],ARGV[2]) else return 0 end",
+                        1,
+                        resource_key,
+                        token,
+                        timeout,
+                    )
+                    if not renewed:
+                        raise ModBotException("Lock ownership lost")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                lost = True
+                owner.cancel()
+
+        task = asyncio.create_task(renew())
         try:
             yield
+        except asyncio.CancelledError:
+            if lost:
+                raise ModBotException(
+                    "Lock lease lost; operation retained for reconciliation."
+                ) from None
+            raise
         finally:
-            # Release lock using Lua script to ensure atomic verification and deletion
-            script = """
-            if redis.call("get", KEYS[1]) == ARGV[1] then
-                return redis.call("del", KEYS[1])
-            else
-                return 0
-            end
-            """
-            await redis_conn.eval(script, 1, resource_key, token)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            with contextlib.suppress(RedisError):
+                await conn.eval(
+                    "if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end",
+                    1,
+                    resource_key,
+                    token,
+                )

@@ -1,20 +1,35 @@
+import logging
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
+
 from src.core.config import config
-import logging
+
+_session = ContextVar("mongo_session", default=None)
 
 log = logging.getLogger("modbot.database")
+
 
 class Database:
     client: AsyncIOMotorClient = None
     db = None
+    transactions_supported = False
 
     @classmethod
     async def connect(cls):
         log.info("Connecting to MongoDB...")
-        cls.client = AsyncIOMotorClient(config.MONGO_URI)
+        cls.client = AsyncIOMotorClient(
+            config.MONGO_URI, tz_aware=True, serverSelectionTimeoutMS=10000
+        )
         cls.db = cls.client[config.MONGO_DB_NAME]
+        hello = await cls.db.command("hello")
+        cls.transactions_supported = bool(hello.get("setName") or hello.get("msg") == "isdbgrid")
         await cls.ensure_indexes()
+        await cls.db.cases.update_many(
+            {"status": {"$exists": False}}, {"$set": {"status": "completed", "origin": "manual"}}
+        )
         log.info("MongoDB connected successfully.")
 
     @classmethod
@@ -25,13 +40,31 @@ class Database:
 
     @classmethod
     async def ensure_indexes(cls):
+        await cls.db.rbac.create_index(
+            [("guild_id", 1), ("type", 1), ("role_id", 1), ("user_id", 1)], unique=True
+        )
+        await cls.db.audit_outbox.create_index([("delivered", 1), ("attempts", 1)])
+        await cls.db.cases.create_index([("status", 1), ("created_at", 1)])
+        await cls.db.cases.create_index(
+            [("operation_id", 1)],
+            unique=True,
+            partialFilterExpression={"operation_id": {"$type": "string"}},
+        )
+        for collection in (cls.db.warns, cls.db.notes, cls.db.punishments):
+            await collection.create_index(
+                [("guild_id", 1), ("case_number", 1)],
+                unique=True,
+                partialFilterExpression={"case_number": {"$type": "number"}},
+            )
         # Mandatory Indexes
         await cls.db.warns.create_index([("guild_id", 1), ("user_id", 1)])
         await cls.db.notes.create_index([("guild_id", 1), ("user_id", 1)])
         await cls.db.punishments.create_index([("guild_id", 1), ("user_id", 1), ("active", 1)])
         await cls.db.configs.create_index([("guild_id", 1)], unique=True)
         await cls.db.cases.create_index([("guild_id", 1), ("case_number", 1)], unique=True)
-        await cls.db.cases.create_index([("guild_id", 1), ("target_user_id", 1), ("created_at", -1)])
+        await cls.db.cases.create_index(
+            [("guild_id", 1), ("target_user_id", 1), ("created_at", -1)]
+        )
         await cls.db.case_counters.create_index([("guild_id", 1)], unique=True)
 
     @classmethod
@@ -41,5 +74,21 @@ class Database:
             {"$inc": {"next_case_number": 1}},
             upsert=True,
             return_document=ReturnDocument.AFTER,
+            session=_session.get(),
         )
         return int(counter["next_case_number"])
+
+    @classmethod
+    @asynccontextmanager
+    async def transaction(cls):
+        """Use transactions on replica sets; standalone recovers from durable cases."""
+        if not cls.transactions_supported or _session.get() is not None:
+            yield
+            return
+        async with await cls.client.start_session() as session:
+            async with session.start_transaction():
+                token = _session.set(session)
+                try:
+                    yield
+                finally:
+                    _session.reset(token)

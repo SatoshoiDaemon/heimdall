@@ -8,6 +8,7 @@ from src.core.exceptions import ConfigurationError
 
 load_dotenv()
 
+
 class Config:
     def __init__(self, environ: Mapping[str, str] | None = None):
         env = os.environ if environ is None else environ
@@ -17,8 +18,8 @@ class Config:
         self.REDIS_URI = env.get("REDIS_URI")
         self._captcha_timeout_raw = env.get("CAPTCHA_TIMEOUT_SECONDS", "300")
         self._log_worker_interval_raw = env.get("LOG_WORKER_INTERVAL_SECONDS", "5")
-        self.CAPTCHA_TIMEOUT_SECONDS = None
-        self.LOG_WORKER_INTERVAL_SECONDS = None
+        self.CAPTCHA_TIMEOUT_SECONDS: int = 300
+        self.LOG_WORKER_INTERVAL_SECONDS: int = 5
         self.GUILD_ID = env.get("GUILD_ID")
 
     @staticmethod
@@ -66,5 +67,6 @@ class Config:
             except ValueError as exc:
                 raise ConfigurationError("GUILD_ID must be a positive integer when set.") from exc
         return self
+
 
 config = Config()

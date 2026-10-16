@@ -1,7 +1,9 @@
 import discord
 from discord import app_commands
+
+from src.core.exceptions import RBACAccessDenied
 from src.services.rbac_service import RBACService
-from src.core.exceptions import PermissionDenied, RBACAccessDenied
+
 
 async def check_permission(
     interaction: discord.Interaction, command_name: str, native_permission: str | None = None
@@ -19,6 +21,8 @@ async def check_permission(
     native_allowed = bool(
         native_permission and getattr(user.guild_permissions, native_permission, False)
     )
+    if native_allowed:
+        return True
     rbac_allowed = await RBACService.has_permission(guild.id, user.id, roles, command_name)
     if not native_allowed and not rbac_allowed:
         raise RBACAccessDenied(f"You do not have permission to execute `{command_name}`.")

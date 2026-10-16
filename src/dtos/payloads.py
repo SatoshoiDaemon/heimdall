@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional
 
 # Data Transfer Objects used internally across services
+
 
 @dataclass
 class PunishRequestDTO:
@@ -9,8 +9,9 @@ class PunishRequestDTO:
     user_id: int
     moderator_id: int
     reason: str
-    duration_seconds: Optional[int] = None
-    
+    duration_seconds: int | None = None
+
+
 @dataclass
 class WarnRequestDTO:
     guild_id: int
@@ -18,12 +19,14 @@ class WarnRequestDTO:
     moderator_id: int
     reason: str
 
+
 @dataclass
 class NoteRequestDTO:
     guild_id: int
     user_id: int
     moderator_id: int
     note_text: str
+
 
 @dataclass
 class SpamEventDTO:
@@ -34,13 +37,14 @@ class SpamEventDTO:
     content: str
     weight: int = 1
 
+
 @dataclass
 class LogEventDTO:
     guild_id: int
     event_type: str
     description: str
     color: int
-    moderator_id: Optional[int] = None
-    user_id: Optional[int] = None
-    case_number: Optional[int] = None
-    metadata: Optional[dict] = None
+    moderator_id: int | None = None
+    user_id: int | None = None
+    case_number: int | None = None
+    metadata: dict | None = None

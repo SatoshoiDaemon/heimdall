@@ -1,11 +1,12 @@
 name: CI
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   quality:
     runs-on: ubuntu-latest
@@ -13,26 +14,71 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
           cache-dependency-path: requirements-dev.txt
-
-      - name: Install dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
-
-      - name: Lint
-        run: python -m ruff check .
-
-      - name: Compile Python sources
-        run: python -m compileall -q run.py src tests
-
-      - name: Run tests
-        run: python -m pytest
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m ruff check . && python -m ruff format --check .
+      - run: python -m mypy
+      - run: python -m compileall -q run.py src tests scripts
+      - run: python -m pytest -m 'not integration' --cov --cov-report=term-missing --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: [6379:6379]
+        options: >-
+          --health-cmd 'redis-cli ping'
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Start Mongo replica set
+        run: |
+          docker run -d --name mongo -p 27017:27017 mongo:7 --replSet rs0 --bind_ip_all
+          for i in {1..60}; do
+            if docker exec mongo mongosh --quiet --eval 'db.adminCommand("ping").ok'; then break; fi
+            sleep 1
+          done
+          docker exec mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
+          for i in {1..60}; do
+            if docker exec mongo mongosh --quiet --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)'; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Real Redis and Mongo failure/concurrency tests
+        env:
+          HEIMDALL_INTEGRATION: "1"
+          TEST_MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0
+          TEST_REDIS_URI: redis://localhost:6379/15
+        run: python -m pytest -m integration -v
+      - name: Benchmark previous and atomic Redis paths
+        env:
+          TEST_REDIS_URI: redis://localhost:6379/15
+        run: python -m scripts.benchmark_redis > redis-benchmark.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redis-benchmark
+          path: redis-benchmark.json
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env && docker compose config --quiet
+      - run: docker build -t heimdall:ci .
+      - name: Verify non-root image and imports
+        run: |
+          docker run --rm --entrypoint sh heimdall:ci -c 'test "$(id -u)" = 10001 && python -c "from src.core.bot import ModBot; ModBot()"'

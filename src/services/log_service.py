@@ -1,92 +1,240 @@
 import asyncio
 import json
 import logging
+import uuid
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
+from time import perf_counter
+
+import discord
+from pymongo import ReturnDocument
+from redis.exceptions import ResponseError
+
+from src.core.config import config
+from src.core.database import Database, _session
+from src.core.event_bus import EventBus
+from src.core.metrics import counters, observe
 from src.core.redis_client import RedisClient
 from src.dtos.payloads import LogEventDTO
-from src.core.config import config
-from src.core.event_bus import EventBus
-import discord
-from discord.ext import commands
 
 log = logging.getLogger("modbot.logworker")
 
+
 class LogService:
-    QUEUE_KEY = "modbot:log_queue"
+    QUEUE_KEY = "modbot:audit"
+    GROUP = "delivery"
+    MAX_ATTEMPTS = 5
 
     @staticmethod
-    async def enqueue_log(dto: LogEventDTO):
-        conn = RedisClient.redis_conn
-        await conn.lpush(LogService.QUEUE_KEY, json.dumps(dto.__dict__))
+    async def enqueue_log(dto: LogEventDTO, event_id: str | None = None):
+        # Mongo outbox is durable even if Redis is unavailable. Case transactions
+        # write the outbox in the same transaction as their projections/state.
+        event_id = event_id or uuid.uuid4().hex
+        await Database.db.audit_outbox.update_one(
+            {"_id": event_id},
+            {
+                "$setOnInsert": {
+                    "payload": asdict(dto),
+                    "delivered": False,
+                    "attempts": 0,
+                    "created_at": datetime.now(UTC),
+                    "next_attempt": datetime.now(UTC),
+                }
+            },
+            upsert=True,
+            session=_session.get(),
+        )
+        return event_id
 
     @staticmethod
-    async def worker(bot: commands.AutoShardedBot):
-        log.info("Starting Background Log Worker...")
-        # Since this relies on resolving channels via Bot, run in a while loop
+    async def _send(bot, event_id, payload):
+        from src.services.config_service import ConfigService
+
+        settings = await ConfigService.get_guild_config(payload["guild_id"])
+        if not settings.log_channel_id:
+            # Explicit disposition; enabling logs later does not replay history.
+            return "unconfigured"
+        channel = bot.get_channel(settings.log_channel_id)
+        if channel is None:
+            channel = await bot.fetch_channel(settings.log_channel_id)
+        if getattr(channel.guild, "id", None) != payload["guild_id"]:
+            raise ValueError("Audit channel belongs to another guild")
+        embed = discord.Embed(
+            title=payload["event_type"][:256],
+            description=payload["description"][:3500],
+            color=payload["color"],
+        )
+        embed.set_footer(text=f"Event {event_id} | Case {payload.get('case_number') or '-'}")
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        return "sent"
+
+    @staticmethod
+    async def deliver(bot, event_id):
+        now = datetime.now(UTC)
+        token = uuid.uuid4().hex
+        entry = await Database.db.audit_outbox.find_one_and_update(
+            {
+                "_id": event_id,
+                "delivered": False,
+                "attempts": {"$lt": LogService.MAX_ATTEMPTS},
+                "next_attempt": {"$lte": now},
+                "$or": [{"lease_until": {"$exists": False}}, {"lease_until": {"$lte": now}}],
+            },
+            {"$set": {"lease_until": now + timedelta(seconds=120), "lease_token": token}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if entry is None:
+            return False
+        started = perf_counter()
+        try:
+            # Bound delivery duration below its lease to prevent active consumers
+            # overlapping. A crash after send/before ack can still duplicate.
+            outcome = await asyncio.wait_for(
+                LogService._send(bot, event_id, entry["payload"]), timeout=90
+            )
+        except Exception as error:
+            attempts = entry["attempts"] + 1
+            counters["audit_delivery_failed"] += 1
+            await Database.db.audit_outbox.update_one(
+                {"_id": event_id, "lease_token": token},
+                {
+                    "$set": {
+                        "attempts": attempts,
+                        "last_error": str(error)[:500],
+                        "next_attempt": now + timedelta(seconds=min(300, 2**attempts)),
+                        "dead": attempts >= LogService.MAX_ATTEMPTS,
+                    },
+                    "$unset": {"lease_until": "", "lease_token": ""},
+                },
+            )
+            if attempts >= LogService.MAX_ATTEMPTS:
+                await Database.db.audit_failures.update_one(
+                    {"_id": event_id},
+                    {
+                        "$set": {
+                            "payload": entry["payload"],
+                            "error": str(error)[:500],
+                            "attempts": attempts,
+                        }
+                    },
+                    upsert=True,
+                )
+            log.exception(
+                "Audit delivery failed",
+                extra={
+                    "guild_id": entry["payload"]["guild_id"],
+                    "case_id": entry["payload"].get("case_number"),
+                    "action": "audit",
+                    "outcome": "retry",
+                },
+            )
+            return False
+        await Database.db.audit_outbox.update_one(
+            {"_id": event_id, "lease_token": token},
+            {
+                "$set": {"delivered": True, "outcome": outcome, "delivered_at": datetime.now(UTC)},
+                "$unset": {"lease_until": "", "lease_token": ""},
+            },
+        )
+        observe("audit_delivered", started)
+        return True
+
+    @staticmethod
+    async def migrate_legacy():
+        """Atomically wrap old list entries with IDs before claiming them."""
         conn = RedisClient.redis_conn
-        
+        processing = "modbot:log_queue:migrating"
+        for _ in range(20):
+            item = await conn.lindex(processing, -1)
+            if item is None:
+                item = await conn.eval(
+                    """
+                    local raw = redis.call('RPOP', KEYS[1])
+                    if not raw then return false end
+                    local wrapped = cjson.encode({event_id=ARGV[1], raw=raw})
+                    redis.call('LPUSH', KEYS[2], wrapped)
+                    return wrapped
+                """,
+                    2,
+                    "modbot:log_queue",
+                    processing,
+                    uuid.uuid4().hex,
+                )
+            if not item:
+                return
+            try:
+                wrapped = json.loads(item)
+                dto = LogEventDTO(**json.loads(wrapped["raw"]))
+            except (ValueError, TypeError, KeyError):
+                await conn.lpush("modbot:legacy_log_failures", item)
+                await conn.lrem(processing, 1, item)
+                log.error("Malformed legacy audit entry preserved in Redis failure queue")
+                continue
+            await LogService.enqueue_log(dto, event_id=wrapped["event_id"])
+            await conn.lrem(processing, 1, item)
+
+    @staticmethod
+    async def run_once(bot, consumer):
+        conn = RedisClient.redis_conn
+        await LogService.migrate_legacy()
+        try:
+            await conn.xgroup_create(LogService.QUEUE_KEY, LogService.GROUP, id="0", mkstream=True)
+        except ResponseError as error:
+            if "BUSYGROUP" not in str(error):
+                raise
+        now = datetime.now(UTC)
+        # Re-mirror unconfirmed entries after restarts or Redis data loss.
+        docs = (
+            await Database.db.audit_outbox.find(
+                {
+                    "delivered": False,
+                    "attempts": {"$lt": LogService.MAX_ATTEMPTS},
+                    "next_attempt": {"$lte": now},
+                    "$or": [
+                        {"queued_at": {"$exists": False}},
+                        {"queued_at": {"$lte": now - timedelta(seconds=60)}},
+                    ],
+                }
+            )
+            .limit(20)
+            .to_list(length=20)
+        )
+        for entry in docs:
+            await conn.xadd(LogService.QUEUE_KEY, {"event_id": entry["_id"]})
+            await Database.db.audit_outbox.update_one(
+                {"_id": entry["_id"]}, {"$set": {"queued_at": now}}
+            )
+        recovered = await conn.xautoclaim(
+            LogService.QUEUE_KEY, LogService.GROUP, consumer, 60000, count=20
+        )
+        messages = list(recovered[1])
+        fresh = await conn.xreadgroup(
+            LogService.GROUP, consumer, {LogService.QUEUE_KEY: ">"}, count=20
+        )
+        for _, batch in fresh:
+            messages.extend(batch)
+        for stream_id, fields in messages:
+            await LogService.deliver(bot, fields["event_id"])
+            state = await Database.db.audit_outbox.find_one({"_id": fields["event_id"]})
+            # Retry scheduling is durable in Mongo before stream acknowledgment.
+            if state and (state.get("delivered") or not state.get("lease_until")):
+                await conn.xack(LogService.QUEUE_KEY, LogService.GROUP, stream_id)
+                await conn.xdel(LogService.QUEUE_KEY, stream_id)
+        counters["audit_pending"] = await Database.db.audit_outbox.count_documents(
+            {"delivered": False, "dead": {"$ne": True}}
+        )
+        counters["audit_dead"] = await Database.db.audit_outbox.count_documents({"dead": True})
+
+    @staticmethod
+    async def worker(bot):
+        await bot.wait_until_ready()
+        consumer = uuid.uuid4().hex
         while not bot.is_closed():
             try:
-                # Pop batch of logs
-                log_entries = []
-                while len(log_entries) < 20:
-                    item = await conn.rpop(LogService.QUEUE_KEY)
-                    if not item:
-                        break
-                    log_entries.append(json.loads(item))
+                await LogService.run_once(bot, consumer)
+            except Exception:
+                log.exception("Audit worker unavailable; durable outbox retained")
+            await asyncio.sleep(config.LOG_WORKER_INTERVAL_SECONDS)
 
-                if log_entries:
-                    await LogService._process_batch(bot, log_entries)
-                
-                await asyncio.sleep(config.LOG_WORKER_INTERVAL_SECONDS)
-            except Exception as e:
-                log.error(f"Log worker error: {e}")
-                await asyncio.sleep(5)
 
-    @staticmethod
-    async def _process_batch(bot, entries):
-        # Group entries by guild to resolve config efficiently
-        # Since Services are stateless, they must resolve settings dynamically
-        from src.services.config_service import ConfigService 
-        # inline import to avoid circular dependency
-        
-        guilds_map = {}
-        for entry in entries:
-            gid = entry['guild_id']
-            if gid not in guilds_map:
-                guilds_map[gid] = []
-            guilds_map[gid].append(entry)
-            
-        for gid, log_batch in guilds_map.items():
-            g_config = await ConfigService.get_guild_config(gid)
-            if not g_config or not g_config.log_channel_id:
-                continue
-                
-            guild = bot.get_guild(gid)
-            if not guild:
-                continue
-                
-            channel = guild.get_channel(g_config.log_channel_id)
-            if not channel:
-                continue
-
-            # Batch send
-            embeds = []
-            for item in log_batch:
-                embed = discord.Embed(
-                    title=item['event_type'], 
-                    description=item['description'], 
-                    color=item['color']
-                )
-                if item.get('moderator_id'):
-                    embed.set_footer(text=f"Mod ID: {item['moderator_id']}")
-                if item.get('case_number'):
-                    embed.set_footer(text=f"Case #{item['case_number']} | Mod ID: {item.get('moderator_id', 'n/a')}")
-                embeds.append(embed)
-            
-            # Send up to 10 embeds per message (Discord limit)
-            for i in range(0, len(embeds), 10):
-                await channel.send(embeds=embeds[i:i+10])
-                await asyncio.sleep(0.5)
-
-# Subscribe the enqueue function to EventBus natively
 EventBus.subscribe("audit_log", LogService.enqueue_log)

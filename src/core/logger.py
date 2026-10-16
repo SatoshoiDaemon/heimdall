@@ -1,26 +1,31 @@
+import json
 import logging
 import sys
+from datetime import UTC, datetime
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        data = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key in ("guild_id", "case_id", "action", "outcome", "duration_seconds", "metrics"):
+            if hasattr(record, key):
+                data[key] = getattr(record, key)
+        if record.exc_info:
+            data["exception"] = self.formatException(record.exc_info)
+        return json.dumps(data, default=str)
+
 
 def setup_logger():
-    # Use standard logging but cleanly formatted for standard output
     logger = logging.getLogger("modbot")
     logger.setLevel(logging.INFO)
-    
-    # Prevent adding handlers multiple times in case of reloads
-    if logger.hasHandlers():
-        logger.handlers.clear()
-
-    formatter = logging.Formatter(
-        "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
-    # Silence discord.py annoying debugs
+    logger.handlers.clear()
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
     logging.getLogger("discord").setLevel(logging.WARNING)
-    logging.getLogger("discord.http").setLevel(logging.WARNING)
-
     return logger

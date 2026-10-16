@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from src.models.domain import GuildConfig, RolePermission, Warn
 
@@ -10,7 +10,7 @@ def test_mongo_object_id_values_are_normalized():
         user_id=2,
         moderator_id=3,
         reason="test",
-        created_at=datetime.now(timezone.utc),
+        created_at=datetime.now(UTC),
     )
 
     assert isinstance(warn.id, str)

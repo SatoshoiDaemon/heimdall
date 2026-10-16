@@ -4,6 +4,7 @@ from src.core.config import config
 from src.core.exceptions import ConfigurationError
 from src.core.logger import setup_logger
 
+
 def main():
     logger = setup_logger()
     logger.info("Starting up Heimdall...")
@@ -20,11 +21,13 @@ def main():
 
     try:
         # We start the bot using discord.py's native interface
-        bot.run(config.BOT_TOKEN, log_handler=None) # We already setup our custom logger
+        bot.run(config.BOT_TOKEN, log_handler=None)  # We already setup our custom logger
     except KeyboardInterrupt:
         logger.info("Received KeyboardInterrupt, shutting down.")
     except Exception:
         logger.exception("Fatal error while running Heimdall.")
-        
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
