@@ -1,31 +1,31 @@
-# Preparação da release 0.2.0
+# Preparação da primeira release estável
 
-A versão atual é `0.2.0rc1`. A tag estável só deve ser criada após concluir os
-critérios abaixo. Criar arquivos de distribuição não equivale a validar uma
-instalação conectada ao Discord.
+A candidata atual é `0.2.0rc2`. A versão estável `0.2.0` depende da aceitação
+automática e do uso real em hospedagem gerenciada e servidor Discord de teste.
 
-## Critérios de aceitação
+## Aceitação automatizada
 
-- [ ] CI verde em Python 3.11, 3.12 e 3.13, lint/formatação/tipos e cobertura ≥65%.
-- [ ] Integração com MongoDB replica set e Redis reais aprovada.
-- [ ] Imagem construída e execução sem root confirmada.
-- [ ] Instalação limpa via Compose com volumes vazios e token de teste válido.
-- [ ] Cogs e comandos carregados, intents e permissões configurados.
-- [ ] Servidor de teste: 0/1/5/6/20 warnings, páginas inválidas e botões.
-- [ ] Servidor de teste: CAPTCHA válido, inválido, expirado e role sem permissão.
-- [ ] Servidor de teste: hierarquia do autor/bot, owner, admin e grants RBAC.
-- [ ] Servidor de teste: cada regra AutoMod, exceções, cooldown e cases automáticos.
-- [ ] Servidor de teste: ban/unban, timeout/reversão, purge e notas.
-- [ ] Reinício com outbox pendente, falha de canal e reconciliação conferidos.
-- [ ] Logs/healthcheck/backup de volumes e procedimento de recuperação conferidos.
-- [ ] Changelog revisado e versão alterada para 0.2.0 em `src/version.py` e README.
+- [ ] CI verde no commit final, Python 3.11/3.12/3.13, Ruff/formatação/mypy.
+- [ ] Cobertura ≥65% e testes de fluxo/concorrência aprovados.
+- [ ] Integração com MongoDB standalone e replica set aprovada.
+- [ ] Instalação limpa apenas com requirements.txt e imports de produção.
+- [ ] Configuração inválida encerra com código 1; sinais encerram ordenadamente.
 
-## Publicação
+## Aceitação em PaaS e Discord
 
-1. Abra/revise o PR e aguarde todos os checks do commit final.
-2. Conclua o teste de aceitação num servidor descartável; registre o resultado.
-3. Faça merge, confira a CI de main e crie a tag `v0.2.0` nesse commit.
-4. Publique release com CHANGELOG, mudanças de configuração e instruções de upgrade.
+- [ ] Código-fonte completo enviado, runtime e variáveis configurados.
+- [ ] Apenas instalação Python + python run.py necessários para iniciar.
+- [ ] Conexão MongoDB, Cogs, workers e sincronização de comandos conferidos.
+- [ ] /config funciona por categorias sem acesso manual ao banco.
+- [ ] /warnings, /notes e /history: vazio, 1/5/6/20/101 registros, páginas e botões.
+- [ ] CAPTCHA: válido, inválido, expirado, tentativas e falha de cargo.
+- [ ] Hierarquia autor/bot, dono, administrador e RBAC conferidos.
+- [ ] Moderação, reversões, AutoMod, exceções e cases automáticos conferidos.
+- [ ] Reinício recupera sessões CAPTCHA, cases e auditoria pendente.
+- [ ] Falha temporária MongoDB/Discord se recupera sem duplicar a operação.
+- [ ] SIGTERM da plataforma conclui o encerramento e mantém pendências no banco.
+- [ ] Changelog e versão estável atualizados em src/version.py e README.
 
-Nenhuma rotina cria a tag ou publica a release automaticamente. A operação com
-token e servidor reais precisa de acesso ao ambiente do mantenedor.
+Após concluir os critérios, faça merge, confira a CI de main e publique a tag
+`v0.2.0` com changelog e instruções de atualização. Não crie a tag estável antes
+da validação real; a candidata não equivale a um deploy testado em PaaS.

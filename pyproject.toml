@@ -1,7 +1,7 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-markers = ["integration: requires real MongoDB and Redis"]
+markers = ["integration: requires a configured MongoDB instance"]
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]

@@ -1,6 +1,7 @@
 import logging
 import re
 import uuid
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 
 import discord
@@ -30,6 +31,7 @@ log = logging.getLogger("modbot.moderation")
 class ModerationService:
     """Cases are durable intents; completed cases are the source of truth."""
 
+    operation_id = ContextVar("moderation_operation_id", default=None)
     case_repo = CaseRepository()
     warn_repo = WarnRepository()
     punish_repo = PunishmentRepository()
@@ -91,6 +93,7 @@ class ModerationService:
 
     @classmethod
     async def _prepare(cls, *, operation_id=None, origin="manual", **data):
+        operation_id = operation_id or cls.operation_id.get()
         if operation_id:
             previous = await cls.case_repo.find_one({"operation_id": operation_id})
             if previous:
@@ -647,9 +650,13 @@ class ModerationService:
         )
 
     @classmethod
-    async def warnings(cls, guild_id, user_id):
-        return await cls.warn_repo.get_user_warns(guild_id, user_id)
+    async def warnings(cls, guild_id, user_id, page=1, page_size=5):
+        if page < 1:
+            raise ModerationError("Page must be at least 1.")
+        return await cls.warn_repo.get_user_warns(guild_id, user_id, page, page_size)
 
     @classmethod
-    async def notes(cls, guild_id, user_id):
-        return await cls.note_repo.get_user_notes(guild_id, user_id)
+    async def notes(cls, guild_id, user_id, page=1, page_size=5):
+        if page < 1:
+            raise ModerationError("Page must be at least 1.")
+        return await cls.note_repo.get_user_notes(guild_id, user_id, page, page_size)

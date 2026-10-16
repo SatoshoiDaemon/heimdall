@@ -1,54 +1,62 @@
-import json
-import logging
+"""Bounded process-local TTL cache. Values never escape by reference."""
+
+import copy
+from collections import OrderedDict
+from time import monotonic
 from typing import Any
-
-from redis.exceptions import RedisError
-
-from src.core.redis_client import RedisClient
-
-log = logging.getLogger("modbot.cache")
 
 
 class CacheService:
-    @staticmethod
-    async def get(key: str) -> dict[str, Any] | None:
-        conn = RedisClient.redis_conn
-        try:
-            data = await conn.get(key)
-        except RedisError:
-            log.warning("Cache unavailable; reading authoritative database")
+    MAX_ENTRIES = 4096
+    _entries: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+
+    @classmethod
+    def cleanup(cls):
+        now = monotonic()
+        for key, (expires, _) in list(cls._entries.items()):
+            if expires <= now:
+                cls._entries.pop(key, None)
+
+    @classmethod
+    async def get(cls, key: str) -> dict[str, Any] | None:
+        entry = cls._entries.get(key)
+        if entry is None:
             return None
-        if data:
-            return json.loads(data)
-        return None
+        expires, value = entry
+        if expires <= monotonic():
+            cls._entries.pop(key, None)
+            return None
+        cls._entries.move_to_end(key)
+        return copy.deepcopy(value)
 
-    @staticmethod
-    async def set(key: str, data: dict, ttl: int = 3600):
-        conn = RedisClient.redis_conn
-        try:
-            await conn.set(key, json.dumps(data), ex=ttl)
-        except RedisError:
-            log.warning("Cache write skipped")
+    @classmethod
+    async def set(cls, key: str, data: dict, ttl: int = 60):
+        if ttl <= 0:
+            cls._entries.pop(key, None)
+            return
+        cls._entries[key] = (monotonic() + ttl, copy.deepcopy(data))
+        cls._entries.move_to_end(key)
+        while len(cls._entries) > cls.MAX_ENTRIES:
+            cls._entries.popitem(last=False)
 
-    @staticmethod
-    async def delete(key: str):
-        conn = RedisClient.redis_conn
-        await conn.delete(key)
+    @classmethod
+    async def delete(cls, key: str):
+        cls._entries.pop(key, None)
 
-    @staticmethod
-    async def invalidate_guild_config(guild_id: int):
-        await CacheService.delete(f"config:{guild_id}")
+    @classmethod
+    def evict_prefix(cls, prefix: str):
+        for key in list(cls._entries):
+            if key.startswith(prefix):
+                cls._entries.pop(key, None)
 
-    @staticmethod
-    async def invalidate_rbac(guild_id: int):
-        # We might want to flush all user/role RBACs for this guild or individual
-        # For simplicity, we invalidate by pattern or expect rigorous keys
-        conn = RedisClient.redis_conn
-        batch = []
-        async for key in conn.scan_iter(match=f"rbac:{guild_id}:*", count=100):
-            batch.append(key)
-            if len(batch) == 100:
-                await conn.delete(*batch)
-                batch.clear()
-        if batch:
-            await conn.delete(*batch)
+    @classmethod
+    async def invalidate_guild_config(cls, guild_id: int):
+        cls._entries.pop(f"config:{guild_id}", None)
+
+    @classmethod
+    async def invalidate_rbac(cls, guild_id: int):
+        cls.evict_prefix(f"rbac:{guild_id}:")
+
+    @classmethod
+    def clear(cls):
+        cls._entries.clear()

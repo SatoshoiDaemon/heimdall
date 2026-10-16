@@ -1,66 +1,42 @@
-import asyncio
-import contextlib
-import uuid
+"""Per-resource asyncio locks for one Heimdall process, including its shards."""
 
-from redis.exceptions import RedisError
+import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 from src.core.exceptions import ModBotException
-from src.core.redis_client import RedisClient
+
+
+@dataclass
+class _Resource:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
 
 
 class LockService:
-    @staticmethod
-    @contextlib.asynccontextmanager
-    async def get_lock(resource_key: str, timeout: int = 120):
-        """Renewed lease. Losing Redis cancels the owner, never runs unlocked."""
-        token = uuid.uuid4().hex
-        conn = RedisClient.redis_conn
-        try:
-            acquired = await conn.set(resource_key, token, nx=True, ex=timeout)
-        except RedisError as error:
-            raise ModBotException("Redis is unavailable; retry this operation later.") from error
-        if not acquired:
-            raise ModBotException("This resource is busy. Retry shortly.")
-        owner = asyncio.current_task()
-        lost = False
+    MAX_RESOURCES = 4096
+    _resources: dict[str, _Resource] = {}
 
-        async def renew():
-            nonlocal lost
+    @classmethod
+    @asynccontextmanager
+    async def get_lock(cls, resource_key: str, timeout: float = 10):
+        resource = cls._resources.get(resource_key)
+        if resource is None:
+            if len(cls._resources) >= cls.MAX_RESOURCES:
+                raise ModBotException("Too many operations in progress. Retry shortly.")
+            resource = cls._resources[resource_key] = _Resource()
+        resource.users += 1
+        acquired = False
+        try:
             try:
-                while True:
-                    await asyncio.sleep(timeout / 3)
-                    renewed = await conn.eval(
-                        "if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('expire',KEYS[1],ARGV[2]) else return 0 end",
-                        1,
-                        resource_key,
-                        token,
-                        timeout,
-                    )
-                    if not renewed:
-                        raise ModBotException("Lock ownership lost")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                lost = True
-                owner.cancel()
-
-        task = asyncio.create_task(renew())
-        try:
+                await asyncio.wait_for(resource.lock.acquire(), timeout=timeout)
+            except TimeoutError as error:
+                raise ModBotException("This resource is busy. Retry shortly.") from error
+            acquired = True
             yield
-        except asyncio.CancelledError:
-            if lost:
-                raise ModBotException(
-                    "Lock lease lost; operation retained for reconciliation."
-                ) from None
-            raise
         finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            with contextlib.suppress(RedisError):
-                await conn.eval(
-                    "if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end",
-                    1,
-                    resource_key,
-                    token,
-                )
+            if acquired:
+                resource.lock.release()
+            resource.users -= 1
+            if resource.users == 0:
+                cls._resources.pop(resource_key, None)

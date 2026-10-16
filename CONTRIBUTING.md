@@ -1,10 +1,8 @@
 # Contribuindo
 
-Use Python 3.11–3.13 e instale `requirements-dev.txt` em um ambiente virtual.
-A arquitetura separa Cogs (Discord), serviços (regras), repositórios (MongoDB)
-e infraestrutura (conexões, eventos e logs).
-
-## Verificações
+Use Python 3.11–3.13. Instale `requirements-dev.txt` em um ambiente virtual;
+`requirements.txt` contém apenas dependências de produção. Cogs cuidam do
+Discord, serviços das regras de negócio e repositórios do MongoDB.
 
 ```sh
 python -m ruff check .
@@ -14,41 +12,42 @@ python -m compileall -q run.py src tests scripts
 python -m pytest -m 'not integration' --cov
 ```
 
-A cobertura mínima inicial é 65% da aplicação inteira. Não exclua módulos de
-produção para melhorar o número. Prefira testes de comportamento observável,
-falhas e concorrência. A checagem de tipos é progressiva: modelos, DTOs,
-configuração e métricas são a base inicial; amplie o escopo conforme tipar os
-outros módulos.
+Os testes unitários não precisam de serviços externos. Usam MongoDB em memória
+para persistência, mocks da API Discord e as próprias estruturas locais do bot.
+A cobertura mínima é 65% da aplicação inteira. Não exclua módulos de produção
+para melhorar o número. Tipos são verificados progressivamente em modelos,
+DTOs, configuração e métricas.
 
-## Integração real
+## Integração
 
-Inicie um MongoDB replica set e um Redis dedicado. Os testes apagam o DB Redis
-selecionado e criam/removem bancos MongoDB temporários. Não use dados reais.
-A receita exata de inicialização também está em `.github/workflows/ci.yml`.
+Aponte os testes para uma instância MongoDB acessível:
 
 ```sh
 HEIMDALL_INTEGRATION=1 \
-TEST_MONGO_URI='mongodb://localhost:27017/?replicaSet=rs0' \
-TEST_REDIS_URI='redis://localhost:6379/15' \
+TEST_MONGO_URI='mongodb://localhost:27017' \
 python -m pytest -m integration -v
 ```
 
-A suíte cobre Lua real, expiração, concorrência dos contadores, rollback de
-transações, persistência parcial, locks e retomada de mensagens pendentes.
-Testes unitários usam Redis/Mongo em memória; eles complementam a suíte real.
-Discord é substituído por um adaptador de teste para não punir usuários reais.
-Valide alterações de API do Discord em um servidor de teste antes da release.
+A suíte cria e remove bancos temporários com prefixo `heimdall_test_`;
+não apaga outras bases. Use um usuário autorizado a criar bancos de teste.
+Standalone é suportado; se a instância for replica set, os testes também
+verificam rollback transacional. A CI testa os dois modos iniciando um
+binário temporário do MongoDB, sem depender de containers.
 
-Para medir custo Redis:
+Para apenas rodar o bot, os comandos continuam:
 
 ```sh
-TEST_REDIS_URI=redis://localhost:6379/15 python -m scripts.benchmark_redis
+python -m pip install -r requirements.txt
+python run.py
 ```
 
-## Pull requests
+## Alterações
 
-Descreva o problema, comportamento final, testes e mudanças de configuração.
-Mantenha intents, estados de recuperação, hierarquia e semântica de confirmação
-explícitos. Mudanças em schemas devem preservar documentos existentes ou
-incluir migração. Atualize CHANGELOG e documentação quando o comportamento
-exposto mudar. Nunca registre tokens, URIs com senha ou códigos CAPTCHA.
+Priorize testes de CAPTCHA, AutoMod, hierarquia/RBAC, paginação, cases,
+auditoria, concorrência e lifecycle. Locks e caches são locais a um único
+processo; não introduza requisitos de infraestrutura fora do modelo PaaS.
+
+Descreva o problema, comportamento final e validação no PR. Mantenha migrações
+compatíveis e atualize documentação/changelog. Não registre tokens ou
+respostas CAPTCHA. Para alterações de interface, confira limites de embeds,
+labels e componentes e valide a interação real em um servidor de teste.

@@ -32,13 +32,14 @@ jobs:
           path: coverage.xml
   integration:
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:7-alpine
-        ports: [6379:6379]
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s --health-timeout 3s --health-retries 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mongo-mode: [standalone, replica]
+    env:
+      MONGO_MODE: ${{ matrix.mongo-mode }}
+      TEST_MONGO_URI: mongodb://localhost:27017
+      HEIMDALL_INTEGRATION: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -46,39 +47,37 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
-      - name: Start Mongo replica set
+      - name: Start a MongoDB test instance
         run: |
-          docker run -d --name mongo -p 27017:27017 mongo:7 --replSet rs0 --bind_ip_all
-          for i in {1..60}; do
-            if docker exec mongo mongosh --quiet --eval 'db.adminCommand("ping").ok'; then break; fi
-            sleep 1
-          done
-          docker exec mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"localhost:27017"}]})'
-          for i in {1..60}; do
-            if docker exec mongo mongosh --quiet --eval 'quit(db.hello().isWritablePrimary ? 0 : 1)'; then exit 0; fi
-            sleep 1
-          done
-          exit 1
-      - name: Real Redis and Mongo failure/concurrency tests
-        env:
-          HEIMDALL_INTEGRATION: "1"
-          TEST_MONGO_URI: mongodb://localhost:27017/?replicaSet=rs0
-          TEST_REDIS_URI: redis://localhost:6379/15
+          mkdir -p "$RUNNER_TEMP/mongo-bin" "$RUNNER_TEMP/mongo-data"
+          curl --fail --retry 3 --location https://fastdl.mongodb.org/linux/mongodb-linux-x86_64-ubuntu2204-7.0.16.tgz | tar -xz --no-same-owner --strip-components=1 -C "$RUNNER_TEMP/mongo-bin"
+          mongo_args=()
+          if [ "$MONGO_MODE" = replica ]; then mongo_args+=(--replSet rs0); fi
+          "$RUNNER_TEMP/mongo-bin/bin/mongod" --dbpath "$RUNNER_TEMP/mongo-data" --bind_ip 127.0.0.1 --port 27017 --logpath "$RUNNER_TEMP/mongo.log" --fork "${mongo_args[@]}"
+          python scripts/init_test_mongo.py
+      - name: Test against MongoDB
         run: python -m pytest -m integration -v
-      - name: Benchmark previous and atomic Redis paths
-        env:
-          TEST_REDIS_URI: redis://localhost:6379/15
-        run: python -m scripts.benchmark_redis > redis-benchmark.json
-      - uses: actions/upload-artifact@v4
-        with:
-          name: redis-benchmark
-          path: redis-benchmark.json
-  container:
+      - name: MongoDB diagnostic log
+        if: failure()
+        run: cat "$RUNNER_TEMP/mongo.log"
+  source-install:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cp .env.example .env && docker compose config --quiet
-      - run: docker build -t heimdall:ci .
-      - name: Verify non-root image and imports
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Clean production installation from source
         run: |
-          docker run --rm --entrypoint sh heimdall:ci -c 'test "$(id -u)" = 10001 && python -c "from src.core.bot import ModBot; ModBot()"'
+          python -m venv "$RUNNER_TEMP/runtime"
+          "$RUNNER_TEMP/runtime/bin/python" -m pip install -r requirements.txt
+          "$RUNNER_TEMP/runtime/bin/python" -c 'from src.core.bot import ModBot; from src.version import __version__; print(__version__)'
+      - name: Missing token exits with a configuration error
+        run: |
+          set +e
+          env -u BOT_TOKEN "$RUNNER_TEMP/runtime/bin/python" run.py > startup.log 2>&1
+          status=$?
+          set -e
+          cat startup.log
+          test "$status" = 1
+          python -c 'assert "BOT_TOKEN is required" in open("startup.log").read()'

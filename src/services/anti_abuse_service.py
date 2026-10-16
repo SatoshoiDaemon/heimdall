@@ -1,68 +1,72 @@
-import logging
+import hashlib
 import re
-import uuid
+from collections import OrderedDict, deque
+from dataclasses import dataclass, field
+from time import monotonic
 
-from redis.exceptions import RedisError
-
-from src.core.redis_client import RedisClient
 from src.dtos.payloads import SpamEventDTO
 from src.models.domain import AutoModRule
 
-log = logging.getLogger("modbot.automod")
 
-# Per-event weight + unique ID prevents timestamp collisions. Redis TIME avoids
-# clock skew across workers. All expiry, calculation and cooldown are atomic.
-SCORE_SCRIPT = """
-local t = redis.call('TIME')
-local now = tonumber(t[1]) + tonumber(t[2])/1000000
-local cutoff = now-tonumber(ARGV[2])
-redis.call('ZREMRANGEBYSCORE',KEYS[1],'-inf',cutoff)
-redis.call('ZADD',KEYS[1],now,ARGV[4]..':'..ARGV[1])
-redis.call('EXPIRE',KEYS[1],ARGV[2])
-local entries = redis.call('ZRANGE',KEYS[1],0,-1)
-local total = 0
-for _,v in ipairs(entries) do total=total+tonumber(string.match(v,':(%d+)$')) end
-if total >= tonumber(ARGV[3]) then
-    redis.call('DEL',KEYS[1])
-    if redis.call('SET',KEYS[2],'1','NX','EX',ARGV[5]) then return 1 end
-end
-return 0
-"""
+@dataclass
+class _Window:
+    events: deque = field(default_factory=deque)
+    seen: set = field(default_factory=set)
+    total: int = 0
+    expires_at: float = 0
+    cooldown_until: float = 0
 
 
 class AntiAbuseService:
-    @staticmethod
+    MAX_WINDOWS = 10000
+    MAX_EVENTS_PER_WINDOW = 1000
+    _windows: OrderedDict[tuple, _Window] = OrderedDict()
+
+    @classmethod
+    def cleanup(cls):
+        now = monotonic()
+        for key, state in list(cls._windows.items()):
+            if max(state.expires_at, state.cooldown_until) <= now:
+                cls._windows.pop(key, None)
+
+    @classmethod
     async def track_spam(
+        cls,
         dto: SpamEventDTO,
         threshold: int,
         window_sec: int,
         rule: str = "spam",
         cooldown_sec: int | None = None,
     ) -> bool:
-        if threshold < 1 or window_sec < 1 or dto.weight < 1:
-            raise ValueError("Positive spam limits and weights are required.")
-        key = f"spam:{{{dto.guild_id}:{dto.user_id}}}:{rule}"
-        try:
-            return bool(
-                await RedisClient.redis_conn.eval(
-                    SCORE_SCRIPT,
-                    2,
-                    key,
-                    key + ":cooldown",
-                    dto.weight,
-                    window_sec,
-                    threshold,
-                    uuid.uuid4().hex,
-                    cooldown_sec or window_sec,
-                )
-            )
-        except RedisError:
-            # Never punish on incomplete rate data; static filters still work.
-            log.exception(
-                "Rate detector unavailable",
-                extra={"guild_id": dto.guild_id, "action": rule, "outcome": "skipped"},
-            )
+        if not 1 <= threshold <= cls.MAX_EVENTS_PER_WINDOW or window_sec < 1 or dto.weight < 1:
+            raise ValueError("Positive limits required; maximum threshold is 1000.")
+        # No await in this update: all shards share this event loop, so expiry,
+        # score and cooldown change together in the same event-loop turn.
+        key = (dto.guild_id, dto.user_id, rule)
+        now = monotonic()
+        state = cls._windows.setdefault(key, _Window())
+        cls._windows.move_to_end(key)
+        while len(cls._windows) > cls.MAX_WINDOWS:
+            cls._windows.popitem(last=False)
+        if state.cooldown_until > now:
             return False
+        while state.events and state.events[0][0] <= now - window_sec:
+            _, weight, message_id = state.events.popleft()
+            state.total -= weight
+            state.seen.discard(message_id)
+        if dto.message_id in state.seen:
+            return False
+        state.events.append((now, dto.weight, dto.message_id))
+        state.seen.add(dto.message_id)
+        state.total += dto.weight
+        state.expires_at = now + window_sec
+        if state.total >= threshold:
+            state.events.clear()
+            state.seen.clear()
+            state.total = 0
+            state.cooldown_until = now + (cooldown_sec or window_sec)
+            return True
+        return False
 
     @staticmethod
     def rules(config):
@@ -97,8 +101,6 @@ class AntiAbuseService:
                 continue
             hit = False
             if name in {"spam", "repeated"}:
-                import hashlib
-
                 suffix = (
                     name
                     if name == "spam"

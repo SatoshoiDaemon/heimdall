@@ -1,7 +1,7 @@
-from src.core.redis_client import RedisClient
 from src.dtos.payloads import WarnRequestDTO
 from src.models.domain import AutoModRule, Case
 from src.services.anti_abuse_service import AntiAbuseService
+from src.services.cache_service import CacheService
 from src.services.config_service import ConfigService
 from src.services.lock_service import LockService
 from src.services.moderation_service import ModerationService
@@ -37,7 +37,7 @@ class AutoModService:
             if previous:
                 return Case(**previous)
             key = f"automod:cooldown:{guild.id}:{message.author.id}:{rule_name}"
-            if await RedisClient.redis_conn.get(key):
+            if await CacheService.get(key):
                 return None
             if rule.action == "warn":
                 case = await ModerationService.issue_warn(
@@ -77,5 +77,5 @@ class AutoModService:
                         metadata={"message_id": message.id},
                     )
                     case = await ModerationService._apply(case, guild, message.channel)
-            await RedisClient.redis_conn.set(key, "1", ex=rule.cooldown_seconds)
+            await CacheService.set(key, {"active": True}, ttl=rule.cooldown_seconds)
             return case

@@ -96,7 +96,11 @@ class ModerationCog(commands.Cog):
     async def _execute(self, interaction: discord.Interaction, operation: Awaitable, title: str):
         await interaction.response.defer(ephemeral=True)
         try:
-            result = await operation
+            token = ModerationService.operation_id.set(f"discord:{interaction.id}")
+            try:
+                result = await operation
+            finally:
+                ModerationService.operation_id.reset(token)
         except ModBotException as error:
             await interaction.followup.send(embed=format_error(str(error)), ephemeral=True)
         except discord.HTTPException:
@@ -155,16 +159,24 @@ class ModerationCog(commands.Cog):
         guild = self._guild(interaction)
         await interaction.response.defer(ephemeral=True)
         try:
-            warnings = await ModerationService.warnings(guild.id, target.id)
-            lines = [
-                f"**Warning #{getattr(warning, 'case_number', 'legacy')}**\n"
-                f"**Reason:** {warning.reason}\n"
-                f"**Moderator:** <@{warning.moderator_id}>\n"
-                f"**Revoked:** {'yes' if warning.revoked else 'no'}"
-                for warning in warnings
-            ]
-            view = PaginationView(f"Warnings — {target}", lines, page=page)
-            view.owner_id, view.permission = interaction.user.id, "warnings"
+            from src.cogs.case_views import RecordsView
+
+            def render(warning):
+                return (
+                    f"**Warning #{warning.case_number or 'legacy'}**\n**Reason:** {warning.reason}\n"
+                    f"**Moderator:** <@{warning.moderator_id}>\n**Revoked:** {'yes' if warning.revoked else 'no'}"
+                )
+
+            view = RecordsView(
+                guild.id,
+                interaction.user.id,
+                page,
+                {"user_id": target.id},
+                render,
+                kind="warnings",
+                title=f"Warnings — {target}",
+            )
+            await view.load()
             await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
         except ModBotException as error:
             await interaction.followup.send(embed=format_error(str(error)), ephemeral=True)
@@ -339,10 +351,18 @@ class ModerationCog(commands.Cog):
         guild = self._guild(interaction)
         await interaction.response.defer(ephemeral=True)
         try:
-            notes = await ModerationService.notes(guild.id, target.id)
-            lines = [f"**Note** — {note.note}\nModerator: <@{note.moderator_id}>" for note in notes]
-            view = PaginationView(f"Notes — {target}", lines, page=page)
-            view.owner_id, view.permission = interaction.user.id, "notes"
+            from src.cogs.case_views import RecordsView
+
+            view = RecordsView(
+                guild.id,
+                interaction.user.id,
+                page,
+                {"user_id": target.id},
+                lambda note: f"**Note** — {note.note}\nModerator: <@{note.moderator_id}>",
+                kind="notes",
+                title=f"Notes — {target}",
+            )
+            await view.load()
             await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
         except ModBotException as error:
             await interaction.followup.send(embed=format_error(str(error)), ephemeral=True)

@@ -15,7 +15,6 @@ class Config:
         self.BOT_TOKEN = env.get("BOT_TOKEN")
         self.MONGO_URI = env.get("MONGO_URI")
         self.MONGO_DB_NAME = env.get("MONGO_DB_NAME")
-        self.REDIS_URI = env.get("REDIS_URI")
         self._captcha_timeout_raw = env.get("CAPTCHA_TIMEOUT_SECONDS", "300")
         self._log_worker_interval_raw = env.get("LOG_WORKER_INTERVAL_SECONDS", "5")
         self.CAPTCHA_TIMEOUT_SECONDS: int = 300
@@ -54,7 +53,6 @@ class Config:
             raise ConfigurationError("MONGO_DB_NAME is required.")
 
         self._validate_uri(self.MONGO_URI, "MONGO_URI", {"mongodb", "mongodb+srv"})
-        self._validate_uri(self.REDIS_URI, "REDIS_URI", {"redis", "rediss"})
 
         if self.CAPTCHA_TIMEOUT_SECONDS > 86_400:
             raise ConfigurationError("CAPTCHA_TIMEOUT_SECONDS cannot exceed 86400.")

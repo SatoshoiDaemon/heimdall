@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import uuid
 from dataclasses import asdict
@@ -8,26 +7,45 @@ from time import perf_counter
 
 import discord
 from pymongo import ReturnDocument
-from redis.exceptions import ResponseError
 
 from src.core.config import config
 from src.core.database import Database, _session
 from src.core.event_bus import EventBus
 from src.core.metrics import counters, observe
-from src.core.redis_client import RedisClient
 from src.dtos.payloads import LogEventDTO
 
 log = logging.getLogger("modbot.logworker")
 
 
 class LogService:
-    QUEUE_KEY = "modbot:audit"
-    GROUP = "delivery"
+    QUEUE_SIZE = 1000
+    _queue: asyncio.Queue | None = None
+    _scheduled: set[str] = set()
+
+    @classmethod
+    def reset_queue(cls):
+        cls._queue = asyncio.Queue(maxsize=cls.QUEUE_SIZE)
+        cls._scheduled = set()
+
+    @classmethod
+    def schedule(cls, event_id):
+        if cls._queue is None:
+            cls.reset_queue()
+        if event_id in cls._scheduled:
+            return
+        try:
+            cls._queue.put_nowait(event_id)
+            cls._scheduled.add(event_id)
+        except asyncio.QueueFull:
+            # The record is already durable. The next scan will pick it up.
+            counters["audit_queue_full"] += 1
+
     MAX_ATTEMPTS = 5
 
     @staticmethod
     async def enqueue_log(dto: LogEventDTO, event_id: str | None = None):
-        # Mongo outbox is durable even if Redis is unavailable. Case transactions
+        # Mongo outbox is authoritative; the local queue is bounded and disposable.
+        # Case transactions
         # write the outbox in the same transaction as their projections/state.
         event_id = event_id or uuid.uuid4().hex
         await Database.db.audit_outbox.update_one(
@@ -44,6 +62,7 @@ class LogService:
             upsert=True,
             session=_session.get(),
         )
+        LogService.schedule(event_id)
         return event_id
 
     @staticmethod
@@ -142,100 +161,56 @@ class LogService:
         return True
 
     @staticmethod
-    async def migrate_legacy():
-        """Atomically wrap old list entries with IDs before claiming them."""
-        conn = RedisClient.redis_conn
-        processing = "modbot:log_queue:migrating"
-        for _ in range(20):
-            item = await conn.lindex(processing, -1)
-            if item is None:
-                item = await conn.eval(
-                    """
-                    local raw = redis.call('RPOP', KEYS[1])
-                    if not raw then return false end
-                    local wrapped = ARGV[1] .. ':' .. raw
-                    redis.call('LPUSH', KEYS[2], wrapped)
-                    return wrapped
-                """,
-                    2,
-                    "modbot:log_queue",
-                    processing,
-                    uuid.uuid4().hex,
-                )
-            if not item:
-                return
-            try:
-                event_id, raw = item.split(":", 1)
-                dto = LogEventDTO(**json.loads(raw))
-            except (ValueError, TypeError, KeyError):
-                await conn.lpush("modbot:legacy_log_failures", item)
-                await conn.lrem(processing, 1, item)
-                log.error("Malformed legacy audit entry preserved in Redis failure queue")
-                continue
-            await LogService.enqueue_log(dto, event_id=event_id)
-            await conn.lrem(processing, 1, item)
-
-    @staticmethod
-    async def run_once(bot, consumer):
-        conn = RedisClient.redis_conn
-        await LogService.migrate_legacy()
-        try:
-            await conn.xgroup_create(LogService.QUEUE_KEY, LogService.GROUP, id="0", mkstream=True)
-        except ResponseError as error:
-            if "BUSYGROUP" not in str(error):
-                raise
+    async def run_once(bot):
+        if LogService._queue is None:
+            LogService.reset_queue()
         now = datetime.now(UTC)
-        # Re-mirror unconfirmed entries after restarts or Redis data loss.
-        docs = (
-            await Database.db.audit_outbox.find(
-                {
-                    "delivered": False,
-                    "attempts": {"$lt": LogService.MAX_ATTEMPTS},
-                    "next_attempt": {"$lte": now},
-                    "$or": [
-                        {"queued_at": {"$exists": False}},
-                        {"queued_at": {"$lte": now - timedelta(seconds=60)}},
-                    ],
-                }
+        available = LogService.QUEUE_SIZE - len(LogService._scheduled)
+        if available > 0:
+            docs = (
+                await Database.db.audit_outbox.find(
+                    {
+                        "delivered": False,
+                        "attempts": {"$lt": LogService.MAX_ATTEMPTS},
+                        "next_attempt": {"$lte": now},
+                        "$or": [
+                            {"lease_until": {"$exists": False}},
+                            {"lease_until": {"$lte": now}},
+                        ],
+                    },
+                    {"_id": 1},
+                )
+                .sort("next_attempt", 1)
+                .limit(min(available, 100))
+                .to_list(length=min(available, 100))
             )
-            .limit(20)
-            .to_list(length=20)
-        )
-        for entry in docs:
-            await conn.xadd(LogService.QUEUE_KEY, {"event_id": entry["_id"]})
-            await Database.db.audit_outbox.update_one(
-                {"_id": entry["_id"]}, {"$set": {"queued_at": now}}
-            )
-        recovered = await conn.xautoclaim(
-            LogService.QUEUE_KEY, LogService.GROUP, consumer, 60000, count=20
-        )
-        messages = list(recovered[1])
-        fresh = await conn.xreadgroup(
-            LogService.GROUP, consumer, {LogService.QUEUE_KEY: ">"}, count=20
-        )
-        for _, batch in fresh:
-            messages.extend(batch)
-        for stream_id, fields in messages:
-            await LogService.deliver(bot, fields["event_id"])
-            state = await Database.db.audit_outbox.find_one({"_id": fields["event_id"]})
-            # Retry scheduling is durable in Mongo before stream acknowledgment.
-            if state and (state.get("delivered") or not state.get("lease_until")):
-                await conn.xack(LogService.QUEUE_KEY, LogService.GROUP, stream_id)
-                await conn.xdel(LogService.QUEUE_KEY, stream_id)
+            for entry in docs:
+                LogService.schedule(entry["_id"])
+        for _ in range(20):
+            try:
+                event_id = LogService._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                await LogService.deliver(bot, event_id)
+            finally:
+                LogService._scheduled.discard(event_id)
+                LogService._queue.task_done()
         counters["audit_pending"] = await Database.db.audit_outbox.count_documents(
             {"delivered": False, "dead": {"$ne": True}}
         )
         counters["audit_dead"] = await Database.db.audit_outbox.count_documents({"dead": True})
+        counters["audit_queue_size"] = LogService._queue.qsize()
 
     @staticmethod
     async def worker(bot):
         await bot.wait_until_ready()
-        consumer = uuid.uuid4().hex
         while not bot.is_closed():
-            try:
-                await LogService.run_once(bot, consumer)
-            except Exception:
-                log.exception("Audit worker unavailable; durable outbox retained")
+            if bot.is_ready():
+                try:
+                    await LogService.run_once(bot)
+                except Exception:
+                    log.exception("Audit worker unavailable; Mongo records retained for retry")
             await asyncio.sleep(config.LOG_WORKER_INTERVAL_SECONDS)
 
 

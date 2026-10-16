@@ -15,8 +15,8 @@ cada submissão de modal revalida a autorização.
   limpa a lista. Administradores e bots também são excluídos.
 - **Permissions**: explica os comandos RBAC e a política de hierarquia.
 
-A configuração é por servidor. Mudanças são validadas e auditadas; revisões do
-cache impedem que uma invalidação incompleta restaure valores antigos.
+A configuração é por servidor. Mudanças são validadas e auditadas e invalidam
+imediatamente o cache local.
 
 ## Regras
 
@@ -33,7 +33,7 @@ Cada regra aceita `warn`, `delete` ou `timeout`; não há punições implícitas
 Duração do timeout: 1–2419200 segundos. Cooldown: 1–86400 segundos por membro e
 regra, aplicado após sucesso. Limite: 1–1000. `spam_cooldown_seconds` é a janela
 compartilhada de acumulação (padrão 60s); o cooldown de cada regra é independente.
-Spam e repetição usam atualização atômica no Redis e limpam a janela ao atingir
+Spam e repetição usam uma janela local em memória e limpam os registros ao atingir
 o limite. Durante cooldown não repetem a punição.
 
 As flags antigas `anti_spam_enabled`, `anti_link_enabled` e `anti_mention_enabled`
@@ -78,7 +78,8 @@ sempre a hierarquia.
 Datas ISO são interpretadas em UTC; `until` é um instante inclusivo. Use o dia
 seguinte para incluir o último dia inteiro. A página começa em 1; páginas
 inexistentes são rejeitadas. Os botões do histórico consultam o banco mantendo
-os filtros. Listagens de advertências e notas paginam a lista completa.
+os filtros. Advertências, notas e histórico consultam páginas diretamente no MongoDB,
+sem recortar novamente uma página já carregada.
 
 ## Verificação
 
@@ -86,4 +87,6 @@ Configure o cargo antes de disponibilizar `/manual_verify`. O membro recebe
 uma imagem efêmera e usa `/solve_captcha code:ABC123`. Código errado, expirado
 ou consumido não concede cargo. Falhas de atribuição preservam o código até
 sua expiração; se o cargo já foi concedido antes de uma interrupção, repetir a
-solução conclui a sessão sem atribuí-lo novamente.
+solução conclui a sessão sem atribuí-lo novamente. Após cinco respostas inválidas,
+gere outro desafio. A sessão permanece no MongoDB até expirar e continua
+utilizável após reiniciar o processo.

@@ -38,3 +38,9 @@ class BaseRepository:
 
     async def count(self, query: dict[str, Any]) -> int:
         return await self.col.count_documents(query)
+
+    async def find_page(self, query: dict, page: int, page_size: int = 5):
+        if page < 1 or not 1 <= page_size <= 100:
+            raise ValueError("Invalid pagination.")
+        cursor = self.col.find(query).sort([("case_number", -1), ("_id", -1)])
+        return await cursor.skip((page - 1) * page_size).limit(page_size).to_list(length=page_size)

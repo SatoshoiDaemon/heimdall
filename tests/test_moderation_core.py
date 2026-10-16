@@ -8,19 +8,14 @@ from src.services.moderation_service import ModerationService
 
 @pytest.fixture
 async def moderation_fakes(monkeypatch):
-    from fakeredis.aioredis import FakeRedis
     from mongomock_motor import AsyncMongoMockClient
 
     from src.core.database import Database
-    from src.core.redis_client import RedisClient
 
     client = AsyncMongoMockClient()
-    redis = FakeRedis(decode_responses=True)
     monkeypatch.setattr(Database, "db", client.test)
     monkeypatch.setattr(Database, "transactions_supported", False)
-    monkeypatch.setattr(RedisClient, "redis_conn", redis)
     yield client.test
-    await redis.aclose()
 
 
 @pytest.mark.asyncio

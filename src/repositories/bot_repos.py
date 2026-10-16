@@ -24,8 +24,10 @@ class WarnRepository(BaseRepository):
     def __init__(self):
         super().__init__("warns")
 
-    async def get_user_warns(self, guild_id: int, user_id: int) -> list[Warn]:
-        docs = await self.find_many({"guild_id": guild_id, "user_id": user_id})
+    async def get_user_warns(
+        self, guild_id: int, user_id: int, page: int = 1, page_size: int = 5
+    ) -> list[Warn]:
+        docs = await self.find_page({"guild_id": guild_id, "user_id": user_id}, page, page_size)
         return [Warn(**d) for d in docs]
 
     async def get_by_case_number(self, guild_id: int, case_number: int) -> Warn | None:
@@ -43,8 +45,10 @@ class NoteRepository(BaseRepository):
     def __init__(self):
         super().__init__("notes")
 
-    async def get_user_notes(self, guild_id: int, user_id: int) -> list[Note]:
-        docs = await self.find_many({"guild_id": guild_id, "user_id": user_id})
+    async def get_user_notes(
+        self, guild_id: int, user_id: int, page: int = 1, page_size: int = 5
+    ) -> list[Note]:
+        docs = await self.find_page({"guild_id": guild_id, "user_id": user_id}, page, page_size)
         return [Note(**d) for d in docs]
 
 

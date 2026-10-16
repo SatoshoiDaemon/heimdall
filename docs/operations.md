@@ -1,91 +1,114 @@
 # Operação e recuperação
 
-## Cases
+## Modelo de execução
 
-Estados: `pending` → `applying` → `applied` → `completed`. Ações apenas no banco
-saltam diretamente de pending para completed. `failed` indica uma recusa de
-permissão; `uncertain` indica resultado externo ambíguo de purge/kick.
-`revoked`/`active` continuam indicando reversão da punição, sem apagar o case.
+Um processo Python por bot/aplicação, incluindo todos os shards gerenciados
+pelo discord.py. Cache, janelas de spam, cooldowns, locks e fila local não são
+compartilhados entre processos. Não configure múltiplas réplicas simultâneas
+do mesmo bot. A hospedagem pode reiniciar o processo; o MongoDB preserva os
+dados permanentes e as sessões CAPTCHA.
 
-A reconciliação roda a cada 20s após o gateway estar pronto. Ela usa os mesmos
-locks de usuário das ações manuais, revalida hierarquia e repara projeções de
-advertências, notas, timeouts e reversões. Operações em andamento mantêm lease
-Redis renovável; perda da lease interrompe a execução e preserva a intenção.
-Sem Redis, moderação falha de forma fechada e o detector não presume abuso.
+Os logs são JSON em stdout; nenhuma porta, arquivo de heartbeat ou volume
+persistente local é necessário. Workers locais iniciam após carregar os Cogs
+e sincronizar os comandos. Falhas críticas interrompem a inicialização. Se um
+worker essencial terminar inesperadamente, o processo encerra com erro para
+a PaaS reiniciá-lo. Desconexões temporárias do MongoDB são registradas e os
+workers voltam a tentar; o driver e o gateway usam suas rotinas de reconexão.
 
-O banco é a fonte de verdade; as coleções warns, punishments e notes são
-projeções recuperáveis. Em replica sets, projeções, outbox e conclusão são
-transacionais. Em standalone, esses passos podem ficar temporariamente
-incompletos até a reconciliação. Nunca se promete uma transação com o Discord.
+## Memória e tarefas
 
-Bans verificam se o membro já está banido antes de reaplicar. Timeouts guardam
-o instante final original, evitando estender a duração após reinício.
-Expulsões e purges com estado `applying` após crash ficam `uncertain`. Revise
-`/case`, o audit log Discord e os efeitos reais antes de intervir no banco:
-se confirmar que a ação ocorreu, marque `status: applied` para concluir só a
-persistência; se confirmar que não ocorreu, marque `pending` para repetir.
-Casos pendentes ou incertos bloqueiam novas ações no mesmo alvo até a resolução;
-a recuperação nunca reaplica uma punição antiga após uma nova. Timeouts
-expirados têm suas projeções marcadas como inativas pelo worker.
-Nunca reinicie um purge sem conferir o efeito anterior.
+| Estrutura | Limite/limpeza |
+| --- | --- |
+| Cache compartilhado | 4096 entradas; TTL padrão 60s; descarte LRU e limpeza periódica |
+| Configuração/RBAC | TTL 60s e invalidação imediata nas alterações pelo bot |
+| Janelas AutoMod | 10000 janelas, até 1000 eventos por janela; expiração e descarte LRU |
+| Locks | até 4096 recursos simultâneos; liberados quando não há usuários/esperas |
+| Fila local de auditoria | até 1000 IDs; lotes de 20; excedentes permanecem no MongoDB |
+| EventBus emit | até 256 tarefas; eventos críticos usam publish aguardado |
+
+A manutenção limpa cache/janelas a cada 20s. Cache também verifica TTL em cada
+leitura. O controle de spam usa relógio monotônico e atualiza a janela sem
+suspender a execução, somando e removendo pesos incrementalmente. IDs de
+mensagem repetidos não aumentam a pontuação. Ao atingir o limite, limpa a
+janela e ativa cooldown; as ações também têm cooldown por membro/regra.
+Sob descarte LRU, uma janela transitória pode ser esquecida; esse é o limite
+explícito de memória. Reiniciar o bot também reinicia pontuação e cooldown.
+
+O cache evita consultas repetidas de configuração e permissões em cada
+mensagem. Alterações externas feitas diretamente no MongoDB aparecem após o
+TTL; alterações pelo painel e `/rbac` invalidam o cache imediatamente.
+
+## Cases e consistência
+
+Cases são intenções persistentes antes da ação externa. Estados:
+`pending` → `applying` → `applied` → `completed`. Ações apenas no banco saltam
+diretamente para completed. `failed` indica recusa conhecida; `uncertain`
+indica resultado ambíguo de purge/kick. `active` e `revoked` descrevem a punição.
+Timeouts expirados ou substituídos ficam inativos.
+
+A numeração é atômica no MongoDB. IDs de interação Discord, de eventos AutoMod
+e de reversões evitam duplicação ao repetir a mesma operação. Um novo comando
+intencional tem outro ID. Locks asyncio serializam ações por alvo; intenções
+pendentes impedem que uma ação nova ultrapasse uma recuperação incompleta.
+
+Replica sets aplicam transações em projeções, outbox e conclusão. No standalone,
+as mesmas etapas são idempotentes e recuperadas após falhas. Não existe uma
+transação com a API do Discord. Bans verificam o estado atual; timeouts mantêm
+o instante final original. Cases marcados como applied só concluem o banco.
+Purge/kick interrompidos no ponto ambíguo ficam uncertain, sem repetir ações.
+
+Para um case uncertain, confira `/case` e o audit log do Discord. Se confirmar
+que a ação ocorreu, marque `status: applied` no case para concluir a persistência;
+se confirmar que não ocorreu, marque pending para repetir. Casos incertos
+bloqueiam novas ações no alvo até revisão. Não repita purge sem conferir o
+que já foi apagado.
 
 ## Auditoria
 
-A outbox MongoDB recebe um ID estável; o stream Redis `modbot:audit` distribui
-IDs ao grupo `delivery`. Eventos pendentes podem ser retomados via XAUTOCLAIM.
-O envio usa uma lease MongoDB de 120s e timeout de 90s. A confirmação é gravada
-no banco antes do XACK/XDEL. Reespelhamento da outbox recupera perda de Redis.
-Backoff exponencial e cinco tentativas limitam falhas permanentes; registros
-mortos permanecem em `audit_outbox` e `audit_failures`.
+O evento é persistido em `audit_outbox` antes de entrar na asyncio.Queue. A fila
+só guarda IDs. Se estiver cheia, o registro continua no banco; o worker busca
+pendências e recupera a fila após reinício. O EventBus é apenas desacoplamento
+interno e não transporta dados entre processos.
 
-Para reenviar um evento morto após corrigir canal/permissões, redefina no
-registro da outbox: `attempts: 0`, `dead: false`, `delivered: false`,
-`next_attempt: <agora UTC>` e remova `queued_at`, `lease_until` e `lease_token`.
-Mantenha o mesmo `_id`. A coleção de falhas é um histórico; remova sua entrada
-apenas após confirmar a entrega.
+O envio usa um marcador temporário de processamento no MongoDB para impedir
+sobreposição e recuperar interrupções. Após crash durante envio, esse marcador
+expira em até 120s. Cada tentativa tem timeout de 90s. Confirmação só é gravada
+após sucesso. Backoff e cinco tentativas limitam falhas; registros mortos ficam
+na outbox com `dead: true` e na coleção `audit_failures`.
 
-Sem canal configurado, eventos recebem `outcome: unconfigured` e são
-confirmados explicitamente. O envio ao Discord é pelo menos uma vez: um crash
-após envio e antes da confirmação pode duplicar a mensagem. O rodapé mantém o
-ID para identificar essas duplicações.
+A entrega é pelo menos uma vez: se o Discord receber e a confirmação MongoDB
+falhar, pode haver duplicação com o mesmo ID no rodapé. Eventos sem canal
+configurado recebem resultado explícito unconfigured.
 
-Filas antigas `modbot:log_queue` são migradas com claim atômico para a outbox.
-Entradas malformadas são preservadas em `modbot:legacy_log_failures`.
-Cases antigos sem estado recebem `completed` e origem `manual` na inicialização.
-Índices únicos detectam duplicatas preexistentes; se a criação do índice
-falhar, inspecione e resolva as duplicatas antes de reiniciar.
+Para reenviar após corrigir canal/permissões, redefina no registro da outbox:
+`attempts: 0`, `dead: false`, `delivered: false`, `next_attempt: <agora UTC>` e
+remova `lease_until`/`lease_token`. Preserve `_id`. A fila de falhas mantém o
+histórico. Não há exclusão automática de cases/outbox; a retenção fica sob
+controle do responsável pelo banco.
 
-## Métricas e diagnóstico
+## CAPTCHA
 
-Logs JSON incluem guild_id, case_id, action, outcome e duração quando a operação
-os possui. O snapshot periódico e `/tmp/heimdall-health.json` expõem contadores
-de cases concluídos, falhas de callback/entrega, pendências, fila de falhas e
-última latência de entrega. São métricas por processo, reiniciadas no restart.
-O heartbeat só é escrito com gateway pronto e bancos acessíveis.
+As sessões ficam em `captcha_sessions`: hash da resposta, guild/user,
+expiração, tentativas e estado consumido. Um índice TTL limpa sessões antigas;
+a validade é conferida pelo horário mesmo antes dessa limpeza. Após cinco
+respostas inválidas, é necessário gerar outro desafio.
+
+A sessão é consumida após confirmar atribuição do cargo ou verificar que ele
+já está presente. Se Discord funcionar e a gravação final falhar, a mesma
+resposta permite concluir enquanto o desafio ainda estiver válido.
+
+## Diagnóstico
 
 | Sintoma | Conferir |
 | --- | --- |
-| Comando ausente | intents, convite applications.commands, sincronização global |
-| Não consegue punir | permissão do autor, bot e hierarquia; administrators não recebem timeout |
-| CAPTCHA correto sem acesso | cargo configurado/gerenciável, Manage Roles, canal permitido ao cargo |
-| AutoMod não age | regra habilitada, exceções, administrador/bot, cooldown, Redis e permissões |
-| Auditoria sem mensagens | canal, Embed Links, outbox pending/dead e logs do worker |
-| Inicialização falha | variáveis, bancos, índices e erro do Cog essencial |
+| Não inicia | variáveis, runtime Python, acesso ao MongoDB e criação de índices |
+| Processo encerra ao carregar Cog | erro completo nos logs; não há inicialização parcial silenciosa |
+| Comando ausente | escopo applications.commands e sincronização global |
+| Não pune | permissões nativas/RBAC, hierarquia do autor/bot e case pendente |
+| CAPTCHA não libera acesso | cargo válido, Manage Roles e permissões de canal do cargo |
+| AutoMod não age | regra, exceções, admin/bot, janela/cooldown e permissões |
+| Auditoria não chega | canal, Embed Links, outbox pending/dead, conectividade MongoDB |
 
-## Desempenho
-
-A versão anterior fazia quatro round trips por mensagem e transferia todos os
-registros da janela ao Python. A atualização atômica faz um EVAL e mantém a
-janela limitada pelo limiar, sem transferir registros. RBAC consulta grants
-em MongoDB sem cache de autorização e agrupa os cargos numa única consulta;
-revogações não dependem de TTL. Cache de configuração usa revisão autoritativa
-e TTL de uma hora. Invalidações por padrão usam SCAN, nunca KEYS.
-
-Meça no seu Redis com `TEST_REDIS_URI=redis://localhost:6379/15 python -m
-scripts.benchmark_redis`; use um banco dedicado a testes. A CI gera um artefato
-JSON com mediana/p95 anteriores e atuais. Resultados dependem da latência de
-rede; não são usados como asserções frágeis de teste.
-
-Não há coleta automática de telemetria externa nem armazenamento de métricas
-históricas. Defina retenção/backups do MongoDB conforme sua operação; outbox,
-cases e fila de falhas não são apagados automaticamente.
+A manutenção registra métricas por processo: cases concluídos, falhas de
+callbacks/entrega, pendências e tamanho da fila. Esses contadores reiniciam
+junto com o processo; não exigem dashboard ou coletor externo.

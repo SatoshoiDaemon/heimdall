@@ -5,37 +5,18 @@ from unittest.mock import AsyncMock
 
 import discord
 import pytest
-from fakeredis.aioredis import FakeRedis
-from mongomock_motor import AsyncMongoMockClient
-from redis.exceptions import ConnectionError
 
 from src.cogs.moderation import PaginationView
-from src.core.config import config
-from src.core.database import Database
-from src.core.exceptions import InvalidTarget, ModBotException, ModerationError
-from src.core.redis_client import RedisClient
+from src.core.exceptions import InvalidTarget, ModerationError
 from src.dtos.payloads import LogEventDTO, SpamEventDTO, WarnRequestDTO
 from src.models.domain import GuildConfig
 from src.services.anti_abuse_service import AntiAbuseService
 from src.services.automod_service import AutoModService
 from src.services.captcha_service import CaptchaService
 from src.services.config_service import ConfigService
-from src.services.lock_service import LockService
 from src.services.log_service import LogService
 from src.services.moderation_service import ModerationService as Mod
 from src.services.rbac_service import RBACService
-
-
-@pytest.fixture
-async def backend(monkeypatch):
-    db = AsyncMongoMockClient().test
-    redis = FakeRedis(decode_responses=True)
-    monkeypatch.setattr(Database, "db", db)
-    monkeypatch.setattr(Database, "transactions_supported", False)
-    monkeypatch.setattr(RedisClient, "redis_conn", redis)
-    monkeypatch.setattr(config, "CAPTCHA_TIMEOUT_SECONDS", 300)
-    yield db, redis
-    await redis.aclose()
 
 
 class Role:
@@ -128,11 +109,10 @@ async def test_warning_navigation():
     "failure", ["none", "role_missing", "forbidden", "expired", "wrong", "reused"]
 )
 async def test_captcha_completion(backend, failure):
-    _, redis = backend
+    db, _ = backend
     guild, member, _, role, _ = make_guild()
     await ConfigService.update_guild_config(1, {"verified_role_id": role.id})
-    await CaptchaService.create_session(1, member.id)
-    code = await redis.hget("captcha:1:10", "code")
+    code, _ = await CaptchaService.create_session(1, member.id)
     if failure == "role_missing":
         guild.get_role = lambda _: None
     if failure == "forbidden":
@@ -140,11 +120,11 @@ async def test_captcha_completion(backend, failure):
             SimpleNamespace(status=403, reason="Forbidden"), "denied"
         )
     if failure == "expired":
-        await redis.delete("captcha:1:10")
+        await db.captcha_sessions.delete_one({"_id": "1:10"})
     if failure in {"role_missing", "forbidden"}:
         with pytest.raises(ModerationError):
             await CaptchaService.complete(guild, member, code)
-        assert await redis.exists("captcha:1:10")
+        assert (await db.captcha_sessions.find_one({"_id": "1:10"}))["consumed"] is False
         member.add_roles.side_effect = None
         guild.get_role = lambda _: role
         assert await CaptchaService.complete(guild, member, code)
@@ -161,14 +141,14 @@ async def test_captcha_completion(backend, failure):
 
 @pytest.mark.asyncio
 async def test_captcha_crash_after_role_assignment(backend):
-    _, redis = backend
+    db, _ = backend
     guild, member, _, role, _ = make_guild()
     member.roles = [role]
     await ConfigService.update_guild_config(1, {"verified_role_id": role.id})
-    await redis.hset("captcha:1:10", mapping={"code": "ABCDEF"})
-    assert await CaptchaService.complete(guild, member, "ABCDEF")
+    code, _ = await CaptchaService.create_session(1, 10)
+    assert await CaptchaService.complete(guild, member, code)
     member.add_roles.assert_not_awaited()
-    assert not await redis.exists("captcha:1:10")
+    assert (await db.captcha_sessions.find_one({"_id": "1:10"}))["consumed"] is True
 
 
 @pytest.mark.parametrize(
@@ -212,28 +192,17 @@ async def test_rbac_does_not_bypass_hierarchy(backend):
 
 @pytest.mark.asyncio
 async def test_spam_concurrency_cooldown_and_weight(backend):
-    _, redis = backend
-    dto = SpamEventDTO(1, 10, 42, 30, "message", weight=2)
-    hits = await asyncio.gather(*(AntiAbuseService.track_spam(dto, 10, 60) for _ in range(100)))
-    assert sum(hits) == 1
-    await redis.delete("spam:{1:10}:spam:cooldown", "spam:{1:10}:spam")
-    assert await AntiAbuseService.track_spam(dto, 2, 60)
-
-
-@pytest.mark.asyncio
-async def test_redis_unavailable_never_punishes(monkeypatch):
-    monkeypatch.setattr(
-        RedisClient,
-        "redis_conn",
-        SimpleNamespace(
-            eval=AsyncMock(side_effect=ConnectionError()),
-            set=AsyncMock(side_effect=ConnectionError()),
-        ),
+    db, _ = backend
+    hits = await asyncio.gather(
+        *(
+            AntiAbuseService.track_spam(SpamEventDTO(1, 10, i, 30, "message", weight=2), 10, 60)
+            for i in range(100)
+        )
     )
-    assert not await AntiAbuseService.track_spam(SpamEventDTO(1, 10, 42, 30, "message"), 1, 60)
-    with pytest.raises(ModBotException):
-        async with LockService.get_lock("test"):
-            pytest.fail("must not proceed unlocked")
+    assert sum(hits) == 1
+    AntiAbuseService._windows.clear()
+    dto = SpamEventDTO(1, 10, 101, 30, "message", weight=2)
+    assert await AntiAbuseService.track_spam(dto, 2, 60)
 
 
 @pytest.mark.asyncio
@@ -365,24 +334,24 @@ async def test_audit_retries_and_dead_letter(backend, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_worker_restart_and_ack(backend, monkeypatch):
-    db, redis = backend
+async def test_local_queue_worker_restart_and_delivery(backend, monkeypatch):
+    db, _ = backend
     event_id = await LogService.enqueue_log(LogEventDTO(1, "test", "payload", 0))
     monkeypatch.setattr(LogService, "_send", AsyncMock(return_value="sent"))
-    await LogService.run_once(None, "first")
+    await LogService.run_once(None)
     assert (await db.audit_outbox.find_one({"_id": event_id}))["delivered"]
-    await LogService.run_once(None, "restarted")
+    await LogService.run_once(None)
     LogService._send.assert_awaited_once()
-    assert (await redis.xpending(LogService.QUEUE_KEY, LogService.GROUP))["pending"] == 0
+    assert LogService._queue.qsize() == 0
 
 
 @pytest.mark.asyncio
-async def test_outbox_recovers_redis_loss(backend, monkeypatch):
-    db, redis = backend
+async def test_outbox_recovers_local_queue_loss(backend, monkeypatch):
+    db, _ = backend
     event_id = await LogService.enqueue_log(LogEventDTO(1, "test", "payload", 0))
-    await redis.flushall()
+    LogService.reset_queue()
     monkeypatch.setattr(LogService, "_send", AsyncMock(return_value="sent"))
-    await LogService.run_once(None, "after-redis-loss")
+    await LogService.run_once(None)
     assert (await db.audit_outbox.find_one({"_id": event_id}))["delivered"]
 
 
@@ -414,11 +383,13 @@ async def test_case_filters_and_database_pages(backend):
 
 
 @pytest.mark.asyncio
-async def test_config_revision_ignores_stale_cache(backend):
-    _, redis = backend
+async def test_config_invalidation_ignores_stale_cache(backend):
+    db, _ = backend
     await ConfigService.get_guild_config(1)
     await ConfigService.update_guild_config(1, {"anti_spam_enabled": True})
-    assert await redis.exists("config:1:0")
+    from src.services.cache_service import CacheService
+
+    assert await CacheService.get("config:1") is None
     assert (await ConfigService.get_guild_config(1)).anti_spam_enabled
     with pytest.raises(ValueError):
         await ConfigService.update_guild_config(1, {"spam_threshold_score": 0})
@@ -459,20 +430,6 @@ async def test_new_timeout_supersedes_previous_case(backend):
 
 
 @pytest.mark.asyncio
-async def test_legacy_audit_queue_is_migrated_without_loss(backend):
-    import json
-    from dataclasses import asdict
-
-    db, redis = backend
-    raw = json.dumps(asdict(LogEventDTO(1, "legacy", "test", 0)))
-    await redis.lpush("modbot:log_queue", raw, raw)
-    await LogService.migrate_legacy()
-    assert await db.audit_outbox.count_documents({}) == 2
-    assert await redis.llen("modbot:log_queue") == 0
-    assert await redis.llen("modbot:log_queue:migrating") == 0
-
-
-@pytest.mark.asyncio
 async def test_config_callbacks_revalidate_revoked_permission(backend):
     from src.cogs.config_ui import ConfigView
 
@@ -492,13 +449,13 @@ async def test_config_callbacks_revalidate_revoked_permission(backend):
 
 @pytest.mark.asyncio
 async def test_captcha_rejects_elevated_verified_role(backend):
-    _, redis = backend
+    db, _ = backend
     guild, member, _, role, _ = make_guild()
     role.permissions = discord.Permissions(manage_messages=True)
     await ConfigService.update_guild_config(guild.id, {"verified_role_id": role.id})
-    await redis.hset("captcha:1:10", mapping={"code": "ABCDEF"})
+    code, _ = await CaptchaService.create_session(1, 10)
     with pytest.raises(ModerationError, match="elevated"):
-        await CaptchaService.complete(guild, member, "ABCDEF")
+        await CaptchaService.complete(guild, member, code)
     member.add_roles.assert_not_awaited()
 
 
